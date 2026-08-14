@@ -1,0 +1,30 @@
+# Copy to config.yaml and edit. config.yaml is gitignored -- keep your real
+# searches private if you want (they can reveal what roles/comp you target).
+
+searches:
+  - name: "AI Engineer - Lisbon"
+    keywords: "AI Engineer"
+    location: "Lisbon, Portugal"
+    time_posted_seconds: 1800   # ask LinkedIn for jobs posted in the last 30 min
+    # workplace_type: "2"        # 1=on-site, 2=remote, 3=hybrid (omit for all)
+    # experience_levels: "2,3"   # 1=internship 2=entry 3=associate 4=mid-senior 5=director 6=executive
+
+  - name: "Backend Python - Remote EU"
+    keywords: "Python Backend Engineer"
+    location: "European Union"
+    time_posted_seconds: 1800
+    workplace_type: "2"
+
+  - name: "AI Engineer - Remote"
+    keywords: "AI Engineer"
+    location: "Portugal"
+    time_posted_seconds: 1800
+    workplace_type: "2"
+
+pipeline:
+  poll_interval_minutes: 10
+  poll_jitter_seconds: 60        # random +/- jitter so requests aren't clockwork-regular
+  db_path: "state.db"
+  log_path: "jobradar.log"
+  consecutive_error_alert_threshold: 3    # alert after N back-to-back fetch failures (rate limit etc.)
+  consecutive_empty_alert_threshold: 24   # alert after N back-to-back zero-result cycles (~4h @ 10min) -- likely a broken parser
