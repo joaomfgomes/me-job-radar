@@ -1,9 +1,13 @@
 .env
 config.yaml
 state.db
+state.db-shm
+state.db-wal
+jobradar.pid
 *.log
 __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
 *.egg-info/
+.claude/

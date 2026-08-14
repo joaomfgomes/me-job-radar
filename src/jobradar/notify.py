@@ -14,12 +14,21 @@ log = logging.getLogger(__name__)
 
 class TelegramNotifier:
     def __init__(self, bot_token: str, chat_id: str, timeout: float = 10.0) -> None:
-        self._url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        self._base_url = f"https://api.telegram.org/bot{bot_token}"
         self._chat_id = chat_id
+        # separate client for getUpdates: long-polling holds the connection
+        # open for up to `timeout` seconds server-side, so it needs its own
+        # (longer) httpx timeout independent of the quick send_text calls.
         self._client = httpx.Client(timeout=timeout)
+        self._poll_client = httpx.Client(timeout=35.0)
 
     def close(self) -> None:
         self._client.close()
+        self._poll_client.close()
+
+    @property
+    def chat_id(self) -> str:
+        return self._chat_id
 
     def send_job(self, posting: JobPosting) -> bool:
         text = (
@@ -34,7 +43,7 @@ class TelegramNotifier:
     def send_text(self, text: str) -> bool:
         try:
             resp = self._client.post(
-                self._url,
+                f"{self._base_url}/sendMessage",
                 json={
                     "chat_id": self._chat_id,
                     "text": text,
@@ -47,3 +56,18 @@ class TelegramNotifier:
         except httpx.HTTPError as exc:
             log.error("Telegram send failed: %s", exc)
             return False
+
+    def get_updates(self, offset: int | None = None, timeout: int = 25) -> list[dict]:
+        """Long-poll for new messages. Blocks server-side up to `timeout`
+        seconds, so a single call is the entire wait -- no local sleep loop.
+
+        Raises httpx.HTTPStatusError (including 409, meaning another process
+        is already polling this bot) and httpx.HTTPError (network issues) --
+        callers decide how to handle each.
+        """
+        params: dict = {"timeout": timeout}
+        if offset is not None:
+            params["offset"] = offset
+        resp = self._poll_client.get(f"{self._base_url}/getUpdates", params=params)
+        resp.raise_for_status()
+        return resp.json().get("result", [])

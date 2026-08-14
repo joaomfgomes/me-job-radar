@@ -9,6 +9,8 @@ for an alerting system, that's the right failure mode.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 
 from jobradar.config import Settings
 from jobradar.models import SearchConfig
@@ -30,10 +32,25 @@ class Pipeline:
         self._consecutive_empty: dict[str, int] = {}
         self._error_alerted: dict[str, bool] = {}
         self._empty_alerted: dict[str, bool] = {}
+        # overall health, read by the /status command from a different thread
+        self._health_lock = threading.Lock()
+        self.last_poll_at: float | None = None
+        self.last_success_at: float | None = None
 
     def run_cycle(self) -> None:
+        with self._health_lock:
+            self.last_poll_at = time.time()
         for search in self.settings.searches:
             self._run_search(search)
+
+    def health_snapshot(self) -> dict:
+        with self._health_lock:
+            return {
+                "last_poll_at": self.last_poll_at,
+                "last_success_at": self.last_success_at,
+                "consecutive_errors": dict(self._consecutive_errors),
+                "consecutive_empty": dict(self._consecutive_empty),
+            }
 
     def _run_search(self, search: SearchConfig) -> None:
         try:
@@ -50,6 +67,8 @@ class Pipeline:
         # fetch succeeded -- reset error tracking
         self._consecutive_errors[search.name] = 0
         self._error_alerted[search.name] = False
+        with self._health_lock:
+            self.last_success_at = time.time()
 
         if not postings:
             self._handle_empty(search)
