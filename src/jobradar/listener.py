@@ -52,11 +52,23 @@ class CommandListener:
                         "Retrying in %ss.", ERROR_BACKOFF_SECONDS,
                     )
                 else:
-                    log.warning("getUpdates HTTP error: %s. Retrying in %ss.", exc, ERROR_BACKOFF_SECONDS)
+                    # Status code only: the exception text quotes the request
+                    # URL, and a Bot API URL contains the bot token.
+                    log.warning("getUpdates HTTP %s. Retrying in %ss.",
+                                exc.response.status_code, ERROR_BACKOFF_SECONDS)
                 time.sleep(ERROR_BACKOFF_SECONDS)
                 continue
             except httpx.HTTPError as exc:
-                log.warning("getUpdates network error: %s. Retrying in %ss.", exc, ERROR_BACKOFF_SECONDS)
+                log.warning("getUpdates network error: %s. Retrying in %ss.",
+                            type(exc).__name__, ERROR_BACKOFF_SECONDS)
+                time.sleep(ERROR_BACKOFF_SECONDS)
+                continue
+            except Exception as exc:
+                # A malformed body (non-JSON from a proxy/captive portal)
+                # must not take down the main thread -- that would end the
+                # whole process, scheduler included.
+                log.warning("getUpdates returned an unusable response (%s). Retrying in %ss.",
+                            type(exc).__name__, ERROR_BACKOFF_SECONDS)
                 time.sleep(ERROR_BACKOFF_SECONDS)
                 continue
 
@@ -72,8 +84,8 @@ class CommandListener:
         discard it, so commands sent while the bot was down don't replay."""
         try:
             updates = self._notifier.get_updates(offset=-1, timeout=0)
-        except httpx.HTTPError as exc:
-            log.warning("Could not check for backlog updates: %s", exc)
+        except Exception as exc:
+            log.warning("Could not check for backlog updates: %s", type(exc).__name__)
             return None
         if not updates:
             return None
