@@ -1,5 +1,5 @@
 # Copy to profile.yaml and edit. Feeds both the deterministic pre-filter
-# and the LLM scorer (stage 2). profile.yaml is gitignored -- it's your
+# and the LLM scorer. profile.yaml is gitignored -- it's your
 # career details, not code.
 
 target_roles:
@@ -32,6 +32,15 @@ max_years_experience: 3
 languages:
   - English
   # - Portuguese
+
+# Where you can work. Given to the model, which answers "does this job fit?"
+# from the full description -- LinkedIn's guest search ignores its own
+# remote filter, so this is the only place location is enforced. Leave
+# empty to accept any location.
+location_preferences: |
+  Based in Lisbon, Portugal. Accepts on-site or hybrid roles in Lisbon and
+  fully remote roles that can be done from Portugal. Does not accept
+  on-site or hybrid roles elsewhere.
 
 # Roles that score low unless clearly LLM/GenAI-application-focused.
 # The scorer treats these as "adjacent, not default-relevant" --

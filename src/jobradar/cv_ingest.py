@@ -22,20 +22,22 @@ Run directly:  uv run python -m jobradar.cv_ingest [cv.pdf] [profile.generated.y
 from __future__ import annotations
 
 import logging
-import os
 import re
 import sys
 from pathlib import Path
 
 import yaml
 from dotenv import load_dotenv
-from openai import OpenAI
 from pydantic import BaseModel
 from pypdf import PdfReader
 
+from jobradar.llm import DEFAULT_MODEL, ClaudeClient
+
 log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gpt-4o-mini"
+# Entries the CV left blank. They are never shown to a model as if they
+# were real content (see format_cv_context).
+_UNSPECIFIED = ("unspecified", "[UNSPECIFIED]")
 
 # Matches "[PREENCHER: ...]" (Portuguese "fill in"), and the common
 # English equivalents, case-insensitively. Extend this if your CV uses a
@@ -90,35 +92,30 @@ def scrub_placeholders(text: str) -> str:
 
 
 class CVIngestor:
-    def __init__(self, api_key: str, model: str = DEFAULT_MODEL, timeout: float = 60.0) -> None:
+    """Turns scrubbed CV text into an ExtractedProfile, via Claude."""
+
+    def __init__(self, client: ClaudeClient, model: str = DEFAULT_MODEL) -> None:
+        self._client = client
         self._model = model
-        self._client = OpenAI(api_key=api_key, timeout=timeout)
 
     @classmethod
     def from_env(cls, model: str = DEFAULT_MODEL) -> CVIngestor:
         load_dotenv()  # standalone CLI entry point -- main.py's settings loader isn't in play here
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY must be set in .env (see .env.example).")
-        return cls(api_key=api_key, model=model)
+        return cls(ClaudeClient.from_env(), model=model)
 
     def close(self) -> None:
         self._client.close()
 
     def extract(self, scrubbed_cv_text: str) -> ExtractedProfile:
-        completion = self._client.beta.chat.completions.parse(
+        """Raises on any failure: this is a manual tool, and a half-read CV
+        is worse than an error message."""
+        return self._client.parse(
             model=self._model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": scrubbed_cv_text},
-            ],
-            response_format=ExtractedProfile,
-            temperature=0,
+            system=SYSTEM_PROMPT,
+            user=scrubbed_cv_text,
+            schema=ExtractedProfile,
+            effort="medium",
         )
-        parsed = completion.choices[0].message.parsed
-        if parsed is None:
-            raise ValueError(f"no parsed output (finish_reason={completion.choices[0].finish_reason})")
-        return parsed
 
 
 def write_generated_profile(profile: ExtractedProfile, output_path: str | Path) -> None:
@@ -145,14 +142,21 @@ def write_generated_profile(profile: ExtractedProfile, output_path: str | Path) 
         yaml.dump(data, f, sort_keys=False, allow_unicode=True)
 
 
+def _is_real(value: object) -> bool:
+    return bool(value) and str(value).strip() not in _UNSPECIFIED
+
+
 def format_cv_context(path: str | Path = "profile.generated.yaml") -> str | None:
-    """Render notable_projects + real experience bullets from
-    profile.generated.yaml into a compact text blob for the deep-scoring
-    prompt (step 4). Returns None if the file doesn't exist, doesn't parse,
-    or has nothing usable -- deep scoring works fine without it, just with
-    less to cite. 'unspecified' / '[UNSPECIFIED]' entries are skipped, same
-    anti-fabrication rule as the rest of this module: a blank placeholder
-    must never reach the LLM as if it were real content.
+    """Render profile.generated.yaml as text for the deep-scoring prompt:
+    experience, projects, skills, certifications, education and languages.
+
+    Returns None if the file doesn't exist, doesn't parse, or has nothing
+    usable -- deep scoring still works without it, with less to cite.
+    'unspecified' entries are skipped: a blank the candidate never filled
+    in must not reach the model as if it were a fact.
+
+    The output must be deterministic for a given file, because it is part
+    of the cached prompt prefix (see scoring.candidate_context).
     """
     path = Path(path)
     if not path.exists():
@@ -165,15 +169,30 @@ def format_cv_context(path: str | Path = "profile.generated.yaml") -> str | None
         return None
 
     lines: list[str] = []
-    for entry in data.get("experience", []) or []:
-        details = (entry.get("details") or "").strip()
-        if not details or details in ("unspecified", "[UNSPECIFIED]"):
-            continue
-        lines.append(f"- {entry.get('role', '')} at {entry.get('company', '')}: {details}")
+    for entry in data.get("experience") or []:
+        if _is_real(entry.get("details")):
+            period = f" ({entry['period']})" if _is_real(entry.get("period")) else ""
+            lines.append(f"- {entry.get('role', '')} at {entry.get('company', '')}{period}: {entry['details'].strip()}")
 
-    projects = data.get("notable_projects") or []
+    projects = [p for p in data.get("notable_projects") or [] if _is_real(p)]
     if projects:
         lines.append(f"- Notable projects: {', '.join(projects)}")
+
+    for label, key in (("Skills named in the CV", "tech_stack"),
+                       ("Certifications", "certifications"),
+                       ("Education", "education")):
+        values = [str(v) for v in data.get(key) or [] if _is_real(v)]
+        if values:
+            lines.append(f"- {label}: {', '.join(values)}")
+
+    languages = data.get("languages") or {}
+    if isinstance(languages, dict):
+        spoken = [f"{name} ({level})" if _is_real(level) else str(name) for name, level in languages.items()]
+        if spoken:
+            lines.append(f"- Spoken languages: {', '.join(spoken)}")
+
+    if _is_real(data.get("seniority_signal")):
+        lines.append(f"- Experience level: {data['seniority_signal']}")
 
     return "\n".join(lines) if lines else None
 

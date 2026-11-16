@@ -1,6 +1,6 @@
 """Shared fakes for the offline test suite. Nothing here touches the network:
 FakeSource/FakeNotifier/FakeScorer/FakeJDFetcher stand in for LinkedIn,
-Telegram, OpenAI and the JD fetcher respectively.
+Telegram, Claude and the JD fetcher respectively.
 """
 
 import pytest
@@ -8,7 +8,7 @@ import pytest
 from jobradar.config import Settings
 from jobradar.models import JobPosting, SearchConfig
 from jobradar.profile import Dealbreakers, Profile
-from jobradar.scoring import DeepScoreResult, Requirement, ScoreResult
+from jobradar.scoring import DeepScoreResult, JobInsights, Requirement, ScoreResult, Skill
 
 
 class FakeSource:
@@ -27,9 +27,11 @@ class FakeNotifier:
         self.texts: list[str] = []
         self.digests: list[tuple[list[dict], int]] = []
         self._next_message_id = 1
+        self.unfiltered_reasons: list[str | None] = []
 
-    def send_job(self, posting, score=None, deep=None, language_unverified=False):
+    def send_job(self, posting, score=None, deep=None, language_unverified=False, unfiltered_reason=None):
         self.sent.append((posting, score, deep, language_unverified))
+        self.unfiltered_reasons.append(unfiltered_reason)
         message_id = self._next_message_id
         self._next_message_id += 1
         return message_id
@@ -80,12 +82,29 @@ def make_requirements(met: int, unmet: int):
     )
 
 
-def make_deep(met=8, unmet=2, junior=True, years_required=None, score=9, reason="Good fit.", unscored=False):
+def make_insights(work_mode="remote"):
+    return JobInsights(
+        role_family="AI Engineer", seniority_level="junior", work_mode=work_mode,
+        contract_type="permanent", salary_min=40000, salary_max=55000, salary_currency="EUR",
+        skills=(
+            Skill("Python", "language", required=True, candidate_has=True),
+            Skill("Kubernetes", "devops", required=True, candidate_has=False),
+            Skill("LangChain", "llm_ai", required=False, candidate_has=True),
+        ),
+    )
+
+
+def make_deep(met=8, unmet=2, junior=True, years_required=None, score=9, reason="Good fit.",
+              unscored=False, location_fit=True, chance=60, insights=None):
     return DeepScoreResult(
         score=score, reason=reason,
         requirements=make_requirements(met, unmet),
         years_required=years_required,
-        is_junior_appropriate=junior, unscored=unscored,
+        is_junior_appropriate=junior, location_fit=location_fit,
+        interview_chance_pct=None if unscored else chance,
+        chance_reason="" if unscored else "Stack matches; no Kubernetes.",
+        insights=None if unscored else (insights or make_insights()),
+        unscored=unscored,
     )
 
 

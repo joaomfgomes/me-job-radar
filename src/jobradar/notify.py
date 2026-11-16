@@ -1,7 +1,6 @@
 """Telegram notifications via the Bot API (sendMessage, HTTP POST, no SDK needed).
 
-A job is fully evaluated before it reaches here (see pipeline.py's module
-docstring), so a message is built once, with its verdict already known --
+A job is fully evaluated before it reaches here (see evaluation.py), so a message is built once, with its verdict already known --
 there is no second pass that revises an alert after the fact.
 
 Two shapes of job message:
@@ -118,6 +117,7 @@ class TelegramNotifier:
         score: int | None = None,
         deep: DeepScoreResult | None = None,
         language_unverified: bool = False,
+        unfiltered_reason: str | None = None,
     ) -> str:
         coverage = deep.coverage_pct if deep is not None and not deep.unscored else None
 
@@ -139,7 +139,20 @@ class TelegramNotifier:
             # let a possibly-wrong-language posting look like any other.
             lines.append("⚠️ Description unavailable — language not verified, check before assuming it's English/Spanish")
 
+        if unfiltered_reason and not language_unverified:
+            # A fail-open alert: say so, or an outage looks like a flood of
+            # bad matches.
+            lines.append(f"⚠️ Not filtered — {escape(unfiltered_reason[:200])}")
+
         if deep is not None and not deep.unscored:
+            if deep.interview_chance_pct is not None:
+                # A model estimate, labelled as one (see scoring.py).
+                chance = f"📈 Interview chance: ~{deep.interview_chance_pct}% (estimate)"
+                if deep.insights is not None and deep.insights.work_mode != "unspecified":
+                    chance += f" · {escape(deep.insights.work_mode)}"
+                lines.append(chance)
+                if deep.chance_reason:
+                    lines.append(f"<i>{escape(deep.chance_reason[:MAX_REASON_CHARS])}</i>")
             if deep.matched:
                 lines.append(f"✅ {_requirement_names(deep.matched)}")
             if deep.missing:
@@ -160,10 +173,14 @@ class TelegramNotifier:
         score: int | None = None,
         deep: DeepScoreResult | None = None,
         language_unverified: bool = False,
+        unfiltered_reason: str | None = None,
     ) -> int | None:
         """Returns the Telegram message_id on success, or None on failure --
         the pipeline treats None as 'not delivered' and retries next cycle."""
-        return self._send(self._format_job_text(posting, score=score, deep=deep, language_unverified=language_unverified))
+        return self._send(self._format_job_text(
+            posting, score=score, deep=deep,
+            language_unverified=language_unverified, unfiltered_reason=unfiltered_reason,
+        ))
 
     def send_digest(self, rows: list[dict], threshold: int) -> bool:
         """One daily message for near-misses: jobs worth knowing about but

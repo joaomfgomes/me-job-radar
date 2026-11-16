@@ -1,10 +1,11 @@
-"""Offline tests for CV ingestion. The OpenAI call is stubbed (same pattern
-as test_scoring.py) -- these never hit the network or need OPENAI_API_KEY.
+"""Offline tests for CV ingestion. The Claude call is stubbed (same pattern
+as test_scoring.py) -- these never hit the network or need an API key.
 
 The scrub_placeholders tests matter most: they're what verifies the
 anti-fabrication guarantee actually holds before any text reaches the LLM.
 """
 
+import pytest
 import yaml
 
 from jobradar.cv_ingest import (
@@ -16,6 +17,7 @@ from jobradar.cv_ingest import (
     scrub_placeholders,
     write_generated_profile,
 )
+from jobradar.llm import ClaudeClient, LLMError
 
 
 def test_scrub_replaces_portuguese_placeholder():
@@ -49,27 +51,6 @@ def test_scrub_leaves_real_bracketed_text_alone():
     assert scrub_placeholders(text) == text
 
 
-class _FakeParsed:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
-
-
-class _FakeMessage:
-    def __init__(self, parsed):
-        self.parsed = parsed
-
-
-class _FakeChoice:
-    def __init__(self, parsed, finish_reason: str = "stop"):
-        self.message = _FakeMessage(parsed)
-        self.finish_reason = finish_reason
-
-
-class _FakeCompletion:
-    def __init__(self, parsed, finish_reason: str = "stop"):
-        self.choices = [_FakeChoice(parsed, finish_reason)]
-
-
 def _sample_extracted_profile() -> ExtractedProfile:
     return ExtractedProfile(
         tech_stack=["Python", "LangGraph", "MCP"],
@@ -88,12 +69,10 @@ def _sample_extracted_profile() -> ExtractedProfile:
     )
 
 
-def test_extract_parses_successful_response(monkeypatch):
-    ingestor = CVIngestor(api_key="test-key")
+def test_extract_returns_what_the_model_parsed(monkeypatch):
+    ingestor = CVIngestor(ClaudeClient(api_key="test-key"))
     fake_profile = _sample_extracted_profile()
-    monkeypatch.setattr(
-        ingestor._client.beta.chat.completions, "parse", lambda **kw: _FakeCompletion(fake_profile)
-    )
+    monkeypatch.setattr(ingestor._client, "parse", lambda **kw: fake_profile)
 
     result = ingestor.extract("scrubbed cv text")
 
@@ -102,22 +81,18 @@ def test_extract_parses_successful_response(monkeypatch):
     ingestor.close()
 
 
-def test_extract_raises_on_refusal(monkeypatch):
+def test_extract_raises_on_failure(monkeypatch):
     """Unlike the scorer, CV ingestion is a manual one-shot run -- it should
-    raise loudly on failure rather than fail open (there's no 'notify
-    anyway' fallback for a CLI tool)."""
-    ingestor = CVIngestor(api_key="test-key")
-    monkeypatch.setattr(
-        ingestor._client.beta.chat.completions,
-        "parse",
-        lambda **kw: _FakeCompletion(None, finish_reason="content_filter"),
-    )
+    raise loudly rather than fail open (a CLI tool has no 'notify anyway')."""
+    ingestor = CVIngestor(ClaudeClient(api_key="test-key"))
 
-    try:
+    def refuse(**kwargs):
+        raise LLMError("no usable output (stop_reason=refusal)")
+
+    monkeypatch.setattr(ingestor._client, "parse", refuse)
+
+    with pytest.raises(LLMError, match="refusal"):
         ingestor.extract("scrubbed cv text")
-        assert False, "expected ValueError"
-    except ValueError as exc:
-        assert "content_filter" in str(exc)
     ingestor.close()
 
 
@@ -149,7 +124,8 @@ def test_format_cv_context_includes_real_experience_and_projects(tmp_path):
     context = format_cv_context(out_path)
 
     assert context is not None
-    assert "AI Engineer at Acme: Built things." in context
+    assert "AI Engineer at Acme (2025-Present): Built things." in context
+    assert "Skills named in the CV: Python, LangGraph, MCP" in context
     assert "RAG Assistant with Evaluation Harness" in context
 
 

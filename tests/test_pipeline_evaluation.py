@@ -10,7 +10,7 @@ Two properties matter throughout and are asserted repeatedly:
 
 import pytest
 
-from jobradar.models import JobPosting, SearchConfig
+from jobradar.models import JobPosting
 from jobradar.pipeline import Pipeline
 from jobradar.profile import Dealbreakers, Profile
 from jobradar.scoring import ScoreResult
@@ -150,11 +150,11 @@ def test_language_mismatch_is_held_back(store, settings, profile, posting):
         "cloudtechnologieen. Je werkt nauw samen met collega's uit verschillende "
         "disciplines om onze producten naar een hoger niveau te tillen."
     )
-    scorer = FakeScorer(ScoreResult(9, "never reached"))
+    scorer = FakeScorer(ScoreResult(9, "Relevant title."))
     notifier, _ = run(store, settings, profile, posting, scorer, FakeJDFetcher(dutch))
 
     assert notifier.sent == []
-    assert scorer.score_calls == []
+    assert scorer.deep_calls == []  # rejected before the deep pass was paid for
     assert "language" in row(store, "score_reason")[0]
 
 
@@ -169,7 +169,7 @@ def test_jd_fetch_failure_alerts_unfiltered(store, settings, profile, posting):
     notifier, _ = run(store, settings, profile, posting, scorer, FakeJDFetcher(None))
 
     assert notifier.sent_postings == [posting]
-    assert "JD fetch failed" in row(store, "score_reason")[0]
+    assert "description unavailable" in row(store, "score_reason")[0]
     _, _, _, language_unverified = notifier.sent[0]
     assert language_unverified is True
 
@@ -207,17 +207,78 @@ def test_no_profile_or_scorer_alerts_everything(store, settings, posting):
     assert notifier.sent_postings == [posting]
 
 
-def test_title_only_mode_alerts_regardless_of_title_score(store, settings, profile, posting):
-    """No jd_fetcher and no source-provided description: there is nothing to
-    check requirements against, so the job goes out rather than being judged
-    on a title alone."""
-    scorer = FakeScorer(ScoreResult(2, "Weak title."))
+def test_no_description_available_alerts_on_the_title_score_alone(store, settings, profile, posting):
+    """No fetcher and no source-provided description: there is nothing to
+    check requirements against, so a relevant-looking title goes out,
+    flagged as unverified."""
+    scorer = FakeScorer(ScoreResult(8, "Relevant title."))
     notifier, _ = run(store, settings, profile, posting, scorer, jd_fetcher=None)
 
     assert notifier.sent_postings == [posting]
     assert scorer.deep_calls == []
     _, _, _, language_unverified = notifier.sent[0]
-    assert language_unverified is True  # no description was ever available to check
+    assert language_unverified is True
+    assert row(store, "outcome") == ("alerted_unfiltered",)
+
+
+def test_title_gate_runs_before_the_description_is_fetched(store, settings, profile, posting):
+    """The whole point of the ordering: an irrelevant title must not cost a
+    LinkedIn request."""
+    jd = FakeJDFetcher("Full JD.")
+    scorer = FakeScorer(ScoreResult(2, "Weak title."), make_deep())
+    notifier, _ = run(store, settings, profile, posting, scorer, jd)
+
+    assert notifier.sent == []
+    assert jd.calls == []
+    assert row(store, "outcome") == ("title_low",)
+
+
+def test_prefilter_still_runs_when_scoring_is_unavailable(store, settings, posting):
+    """Deterministic rules need no model, so a missing API key must not
+    switch them off."""
+    strict = Profile(
+        target_roles=["AI Engineer"], tech_stack=["Python"], seniority="entry-to-mid",
+        max_years_experience=3, languages=["English"], adjacent_roles_require_llm_tie=[],
+        dealbreakers=Dealbreakers(title_contains=["AI Engineer"]), notes="",
+    )
+    notifier, _ = run(store, settings, strict, posting, scorer=None, jd_fetcher=None)
+
+    assert notifier.sent == []
+    assert row(store, "outcome") == ("prefilter",)
+
+
+def test_location_mismatch_is_held_back_even_at_full_coverage(store, settings, profile, posting):
+    scorer = FakeScorer(ScoreResult(9, "Relevant."), make_deep(met=10, unmet=0, location_fit=False))
+    notifier, _ = run(store, settings, profile, posting, scorer, FakeJDFetcher("Full JD."))
+
+    assert notifier.sent == []
+    assert row(store, "outcome") == ("location",)
+
+
+def test_alert_records_chance_and_market_data(store, settings, profile, posting):
+    scorer = FakeScorer(ScoreResult(9, "Relevant."), make_deep(met=9, unmet=1, chance=72))
+    run(store, settings, profile, posting, scorer, FakeJDFetcher("Full JD."))
+
+    assert row(store, "outcome, interview_chance_pct") == ("alerted", 72)
+    assert store.insights_count(days=1) == 1
+    assert {s["name"] for s in store.skill_demand(days=1)} == {"Python", "Kubernetes", "LangChain"}
+
+
+def test_held_back_jobs_still_feed_the_market_data(store, settings, profile, posting):
+    """A job rejected for coverage was still read in full -- what it asks
+    for is exactly the kind of gap the market view exists to show."""
+    scorer = FakeScorer(ScoreResult(9, "Relevant."), make_deep(met=2, unmet=8))
+    notifier, _ = run(store, settings, profile, posting, scorer, FakeJDFetcher("Full JD."))
+
+    assert notifier.sent == []
+    assert store.insights_count(days=1) == 1
+
+
+def test_fail_open_alert_carries_the_reason_to_the_notifier(store, settings, profile, posting):
+    scorer = FakeScorer(ScoreResult(None, "scoring unavailable: HTTP 401", unscored=True))
+    notifier, _ = run(store, settings, profile, posting, scorer, FakeJDFetcher("Full JD."))
+
+    assert "title scoring failed" in notifier.unfiltered_reasons[0]
 
 
 # --- source-provided descriptions ---------------------------------------
@@ -240,7 +301,7 @@ def test_source_description_is_used_instead_of_fetching(store, settings, profile
 def test_notify_failure_leaves_job_unseen_for_retry(store, settings, profile, posting):
     store.mark_seeded(settings.searches[0].name)
     notifier = FakeNotifier()
-    notifier.send_job = lambda posting, score=None, deep=None, language_unverified=False: None
+    notifier.send_job = lambda posting, **kwargs: None
     Pipeline(settings, store, {"linkedin": FakeSource([posting])}, notifier,
              profile=None, scorer=None).run_cycle()
 

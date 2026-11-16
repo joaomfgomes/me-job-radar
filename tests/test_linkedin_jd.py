@@ -8,7 +8,7 @@ from pathlib import Path
 
 import httpx
 
-from jobradar.sources.linkedin_jd import JobDescriptionFetcher
+from jobradar.sources.linkedin_jd import MAX_DESCRIPTION_CHARS, JobDescriptionFetcher
 
 FIXTURE = (Path(__file__).parent / "fixtures" / "job_description.html").read_text()
 
@@ -72,5 +72,5 @@ def test_fetch_truncates_unusually_long_descriptions(monkeypatch):
     text = fetcher.fetch("123")
 
     assert text is not None
-    assert len(text) <= 8000
+    assert len(text) <= MAX_DESCRIPTION_CHARS
     fetcher.close()

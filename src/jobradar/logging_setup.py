@@ -31,7 +31,7 @@ _NOISY_LOGGERS = ("httpx", "httpcore", "httpx2", "httpcore2", "apscheduler.execu
 
 # Shapes of secrets that can show up in URLs / error messages even when the
 # exact value wasn't passed to setup_logging(): Telegram bot tokens in a Bot
-# API path, and OpenAI-style API keys.
+# API path, and "sk-..." API keys (Anthropic's start with sk-ant-).
 _SECRET_PATTERNS = (
     (re.compile(r"/bot\d+:[A-Za-z0-9_-]+"), "/bot<redacted>"),
     (re.compile(r"\bsk-[A-Za-z0-9_-]{16,}"), "sk-<redacted>"),

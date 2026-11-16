@@ -19,14 +19,15 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from jobradar.config import Settings, load_settings
 from jobradar.listener import CommandListener
+from jobradar.llm import API_KEY_ENV
 from jobradar.logging_setup import setup_logging
 from jobradar.notify import TelegramNotifier
 from jobradar.pipeline import Pipeline
 from jobradar.profile import Profile, load_profile
-from jobradar.scoring import OpenAIScorer
+from jobradar.scoring import JobScorer
 from jobradar.sources.linkedin import LinkedInGuestSource
-from jobradar.sources.wellfound import WellfoundSource
 from jobradar.sources.linkedin_jd import JobDescriptionFetcher
+from jobradar.sources.wellfound import WellfoundSource
 from jobradar.store import Store
 
 
@@ -37,26 +38,28 @@ def _raise_system_exit(signum, _frame) -> None:
     raise SystemExit(0)
 
 
-def load_scoring(settings: Settings, log: logging.Logger) -> tuple[Profile | None, OpenAIScorer | None]:
-    """Scoring is opt-in and degrades gracefully: no profile.yaml, or no
-    OPENAI_API_KEY, just means it's off -- the pipeline then notifies
-    everything it finds, as it did before scoring existed. With it on,
-    scoring decides what gets through; see pipeline.py's module docstring.
+def load_scoring(settings: Settings, log: logging.Logger) -> tuple[Profile | None, JobScorer | None]:
+    """Filtering degrades in two steps rather than failing to start:
+
+      * no profile.yaml       -> nothing is filtered, every job is alerted;
+      * profile, but no key   -> only the deterministic prefilter runs.
+
+    With both, the full cascade in evaluation.py decides what gets through.
     """
     profile_path = Path(settings.profile_path)
     if not profile_path.exists():
-        log.info("No %s found -- scoring disabled, every job will be alerted (see profile.example.yaml).", profile_path)
+        log.warning("No %s found -- every job will be alerted unfiltered (see profile.example.yaml).", profile_path)
         return None, None
+    profile = load_profile(profile_path)
 
     try:
-        profile = load_profile(profile_path)
-        scorer = OpenAIScorer.from_env(model=settings.title_model, deep_model=settings.deep_model)
-    except Exception as exc:
-        log.warning("Scoring disabled: %s", exc)
-        return None, None
+        scorer = JobScorer.from_env(title_model=settings.title_model, deep_model=settings.deep_model)
+    except RuntimeError as exc:
+        log.warning("Scoring disabled, prefilter only: %s", exc)
+        return profile, None
 
     log.info("Scoring enabled: profile=%s, title model=%s, deep model=%s",
-             profile_path, scorer.model, scorer.deep_model)
+             profile_path, scorer.title_model, scorer.deep_model)
     return profile, scorer
 
 
@@ -64,7 +67,7 @@ def main() -> None:
     settings = load_settings()
     setup_logging(
         settings.log_path,
-        secrets=(settings.telegram_bot_token, os.environ.get("OPENAI_API_KEY", "")),
+        secrets=(settings.telegram_bot_token, os.environ.get(API_KEY_ENV, "")),
     )
     signal.signal(signal.SIGTERM, _raise_system_exit)
     log = logging.getLogger("jobradar")
@@ -85,19 +88,20 @@ def main() -> None:
         )
     pipeline = Pipeline(settings, store, sources, notifier, profile=profile, scorer=scorer, jd_fetcher=jd_fetcher)
 
-    core, secondary = pipeline.current_searches()
+    core, secondary = pipeline.active_searches()
     locations = sorted({s.location_name for s in core + secondary if s.location_name})
     board_names = sorted({s.source for s in core + secondary})
     log.info("Starting job-radar. %d core + %d rotating searches across %s.",
              len(core), len(secondary), ", ".join(board_names))
     if scorer is not None:
         mode = (
-            f"Alerting on ≥{settings.min_coverage_pct}% CV match, junior-appropriate only.\n"
+            f"Model: {escape(scorer.deep_model)}. Alerting on ≥{settings.min_coverage_pct}% CV match, "
+            f"junior-appropriate, location fits.\n"
             f"Near misses ({settings.digest_min_coverage_pct}-{settings.min_coverage_pct - 1}%) "
             f"digested daily at {settings.digest_hour:02d}:00.\n"
         )
     else:
-        mode = "Scoring is OFF -- every new posting is alerted unfiltered.\n"
+        mode = f"⚠️ Scoring is OFF ({API_KEY_ENV} or profile.yaml missing) -- alerts are not CV-matched.\n"
     notifier.send_text(
         f"🚀 job-radar started.\n"
         f"Boards: {escape(', '.join(board_names), quote=False)}\n"

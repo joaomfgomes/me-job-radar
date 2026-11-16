@@ -9,6 +9,7 @@ from pathlib import Path
 import yaml
 from dotenv import load_dotenv
 
+from jobradar.llm import DEFAULT_MODEL
 from jobradar.models import SearchConfig
 
 
@@ -23,21 +24,21 @@ class Settings:
     consecutive_error_alert_threshold: int = 3
     consecutive_empty_alert_threshold: int = 24  # ~4h at 10-min interval
     log_path: str = "jobradar.log"
-    profile_path: str = "profile.yaml"  # shadow scoring is skipped if this file doesn't exist
-    # Query expansion (step 3): searches worth watching but not worth polling
+    profile_path: str = "profile.yaml"  # filtering is off if this file doesn't exist
+    # Searches worth watching but not worth polling
     # every cycle -- rotated through in small batches instead of all at once,
     # so coverage grows without multiplying LinkedIn traffic 1:1. See
     # Pipeline._next_secondary_batch().
     secondary_searches: list[SearchConfig] = field(default_factory=list)
     secondary_batch_size: int = 2
-    # Deep scoring (step 4): a job's title-only score must be >= this to
-    # trigger a JD fetch + deep re-score. The empirical distribution from
-    # the first shadow-mode week was bimodal with a gap at 5 and 7 -- 4 is
+    # A job's title-only score must be >= this for its description to be
+    # fetched and read by the deep pass. The empirical distribution from
+    # the first week of observation was bimodal with a gap at 5 and 7 -- 4 is
     # the conservative choice: it catches every job that showed ANY
     # ambiguity on the title pass, without spending a JD fetch + LLM call
     # on the obvious-noise majority (scores 2-3, ~87% of volume).
     deep_score_threshold: int = 4
-    # Enforcement (step 6): a job is only alerted if the deep pass finds at
+    # A job is only alerted if the deep pass finds at
     # least this share of the posting's must-have requirements covered by
     # the CV/profile, AND judges it junior-appropriate. Coverage is computed
     # in Python from the requirement list the model returns -- see
@@ -49,16 +50,17 @@ class Settings:
     # once a day, so an over-tight threshold is visible rather than silent.
     digest_min_coverage_pct: int = 60
     digest_hour: int = 9  # local-time hour to send the daily near-miss digest
-    # The deep pass enumerates each requirement and judges it against the
-    # CV -- markedly harder than the title pass's single relevance score,
-    # and only ~13% of jobs reach it, so it gets the stronger model.
-    deep_model: str = "gpt-4o"
-    title_model: str = "gpt-4o-mini"
+    # Claude model ids for the two passes (see scoring.py). Separate
+    # settings so the deep pass -- the harder task, and only run on the
+    # minority of jobs that clear deep_score_threshold -- can be moved to a
+    # stronger model (e.g. "claude-sonnet-5-5") without touching code.
+    deep_model: str = DEFAULT_MODEL
+    title_model: str = DEFAULT_MODEL
     # Raw matrix pieces (config.yaml's search_matrix.locations / .sources),
     # kept alongside the already-expanded `searches`/`secondary_searches` so
     # the pipeline can re-expand the matrix every cycle against whatever
     # locations exist right now -- including ones added at runtime via
-    # /countries add, which config.yaml never sees. See Pipeline._current_searches().
+    # /countries add, which config.yaml never sees. See Pipeline.current_searches().
     matrix_locations: list = field(default_factory=list)
     matrix_sources: dict = field(default_factory=dict)
     extra: dict = field(default_factory=dict)
@@ -166,7 +168,7 @@ def load_settings(config_path: str | Path = "config.yaml", env_path: str | Path 
     # hand-written ones. The matrix's raw pieces (matrix_locations/
     # matrix_sources below) are expanded fresh by the pipeline every cycle
     # instead of baked in once here, so /countries add takes effect without
-    # a restart -- see Pipeline._current_searches().
+    # a restart -- see Pipeline.current_searches().
     search_matrix = raw.get("search_matrix") or {}
     matrix_core, matrix_secondary = _expand_matrix(search_matrix)
     searches = _parse_searches(raw.get("searches", []))
@@ -193,8 +195,8 @@ def load_settings(config_path: str | Path = "config.yaml", env_path: str | Path 
         min_coverage_pct=pipeline.get("min_coverage_pct", 80),
         digest_min_coverage_pct=pipeline.get("digest_min_coverage_pct", 60),
         digest_hour=pipeline.get("digest_hour", 9),
-        deep_model=pipeline.get("deep_model", "gpt-4o"),
-        title_model=pipeline.get("title_model", "gpt-4o-mini"),
+        deep_model=pipeline.get("deep_model", DEFAULT_MODEL),
+        title_model=pipeline.get("title_model", DEFAULT_MODEL),
         matrix_locations=search_matrix.get("locations") or [],
         matrix_sources=search_matrix.get("sources") or {},
     )

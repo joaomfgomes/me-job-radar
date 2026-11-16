@@ -23,13 +23,14 @@ log = logging.getLogger(__name__)
 
 BASE_URL = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting"
 
-# Defensive cap -- observed real descriptions run ~3.5k-6.2k chars. This
-# just guards against an unusual outlier blowing up prompt token cost.
-MAX_DESCRIPTION_CHARS = 8000
+# Defensive cap against a pathological page, set well above real
+# descriptions (observed: ~3.5k-6.2k chars) so that a long one is never cut
+# off before its requirements section.
+MAX_DESCRIPTION_CHARS = 20000
 
 # A 429 here is a bigger deal than one on the search endpoint: a job whose
 # JD we can't fetch skips the language check entirely and gets alerted
-# unfiltered (see pipeline.py's fail-open cascade) -- exactly the failure
+# unfiltered (see evaluation.py's fail-open cascade) -- exactly the failure
 # mode that let a Dutch-only posting through once, right after a restart
 # processed a burst of same-employer postings back-to-back. One retry
 # after a short pause clears a transient burst-limit without adding
