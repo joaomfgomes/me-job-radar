@@ -1,0 +1,77 @@
+# Copy to profile.yaml and edit. Feeds both the deterministic pre-filter
+# and the LLM scorer (stage 2). profile.yaml is gitignored -- it's your
+# career details, not code.
+
+target_roles:
+  - "AI Engineer"
+  - "LLM Engineer"
+  - "Generative AI Engineer"
+  - "Machine Learning Engineer (LLM-focused)"
+  - "Applied AI Engineer"
+  - "Software Engineer (AI/ML products)"
+
+tech_stack:
+  - Python
+  - FastAPI
+  - RAG / retrieval-augmented generation
+  - Agentic frameworks (LangChain, LangGraph, or similar)
+  - LLM APIs (Anthropic, OpenAI, etc.)
+  - Vector databases
+
+seniority: entry-to-mid  # options: intern, entry, mid, senior, staff+ -- used as a ceiling, not a floor
+
+# Numeric counterpart to `seniority`, used when a job board states the
+# required years outright (Wellfound does) -- a deterministic reject, no LLM
+# call needed. Remove or leave blank to rely on the scorer alone.
+max_years_experience: 3
+
+# Enforced two ways (step 5 filter tuning): passed to the LLM scorer as
+# context, and -- when a JD fetcher is configured -- checked deterministically
+# against the full job description before a job is ever notified (see
+# lang_filter.py). List names, not ISO codes; unrecognized names are ignored.
+languages:
+  - English
+  # - Portuguese
+
+# Roles that score low unless clearly LLM/GenAI-application-focused.
+# The scorer treats these as "adjacent, not default-relevant" --
+# a "Data Engineer, LLM platform team" should still score well; a plain
+# "Data Engineer" role should not.
+adjacent_roles_require_llm_tie:
+  - "Data Engineer"
+  - "Data Scientist"
+  - "MLOps Engineer"
+  - "ML Infrastructure Engineer"
+
+# Hard rules -- enforced by the deterministic pre-filter (step 3), before
+# any LLM call. A job matching one of these is dropped/never scored.
+dealbreakers:
+  title_contains:
+    - "Postdoc"
+    - "PhD Position"
+    - "Professor"
+    - "Head of"
+    - "Director"
+    - "VP "
+    - "Principal Engineer"  # too senior for current target
+  employer_contains:
+    - "University"
+    - "Universiteit"
+    - "Institute of Technology"
+  # Roles with zero connection to software/AI -- adjust as false positives show up
+  title_excludes_unless_ai_related:
+    - "Consultant"
+    - "Analyst"
+  # Titles at or above the `seniority` ceiling above -- a hard reject, since
+  # these are certainties, not judgment calls like the LLM scorer's softer
+  # "Seniority ceiling" read. Leave empty to rely on the LLM alone.
+  title_contains_above_ceiling:
+    - "Senior "
+    - "Sr. "
+    - "Staff "
+    - "Lead "
+
+notes: |
+  Free-text context passed to the LLM alongside the job card. Use this for
+  anything the structured fields above don't capture -- e.g. "prefer
+  product companies over consultancies" or "open to contract roles."
