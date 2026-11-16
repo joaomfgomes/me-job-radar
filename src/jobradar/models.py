@@ -40,7 +40,12 @@ class SearchConfig:
     keywords: str
     location: str
     time_posted_seconds: int = 1800  # f_TPR window; how far back to ask for
-    workplace_type: str | None = None  # f_WT: 1=on-site, 2=remote, 3=hybrid
+    # f_WT: 1=on-site, 2=remote, 3=hybrid. Sent to LinkedIn, but the guest
+    # endpoint appears to ignore it just as it ignores f_E (below): on
+    # 2026-11-16 "AI Engineer" in Portugal returned the same 10 cards with
+    # and without f_WT=2. Remote-vs-on-site is therefore decided from the
+    # description, by the deep pass's location_fit (scoring.py).
+    workplace_type: str | None = None
     # How many 10-result pages to walk before giving up -- see
     # LinkedInGuestSource's module docstring. 3 covers 30 postings per
     # window, well above what a 30-minute window returns in practice.

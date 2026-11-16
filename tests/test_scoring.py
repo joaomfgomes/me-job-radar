@@ -1,16 +1,27 @@
-"""Scoring tests run offline: the OpenAI client's beta.chat.completions.parse
-is stubbed, so these never call the real API and never need OPENAI_API_KEY
-set. Constructing the OpenAI client itself makes no network call (lazy),
-so instantiating OpenAIScorer with a dummy key is safe here.
+"""Scoring tests run offline: ClaudeClient.parse is replaced by a stub, so
+nothing here calls the API or needs ANTHROPIC_API_KEY. Building the client
+with a dummy key makes no network call.
 """
 
+import pytest
+
+from jobradar.llm import ClaudeClient, LLMError
 from jobradar.models import JobPosting
 from jobradar.profile import Dealbreakers, Profile
-from jobradar.scoring import OpenAIScorer, build_deep_prompt, build_prompt
+from jobradar.scoring import (
+    DeepScoreResult,
+    JobScorer,
+    Requirement,
+    _DeepSchema,
+    _TitleSchema,
+    build_deep_prompt,
+    build_title_prompt,
+    candidate_context,
+)
 
 
-def make_profile() -> Profile:
-    return Profile(
+def make_profile(**overrides) -> Profile:
+    fields = dict(
         target_roles=["AI Engineer", "LLM Engineer"],
         tech_stack=["Python", "RAG"],
         seniority="entry-to-mid",
@@ -19,256 +30,166 @@ def make_profile() -> Profile:
         adjacent_roles_require_llm_tie=["Data Engineer"],
         dealbreakers=Dealbreakers(),
         notes="Prefer product companies over consultancies.",
+        location_preferences="On-site only in Porto; remote from Portugal.",
     )
+    return Profile(**{**fields, **overrides})
 
 
 def make_posting(title: str = "AI Engineer", company: str = "Acme") -> JobPosting:
     return JobPosting(
-        job_id="1",
-        title=title,
-        company=company,
-        location="Remote",
-        url="https://example.com",
-        posted_label="1h ago",
-        search_name="test",
+        job_id="1", title=title, company=company, location="Remote",
+        url="https://example.com", posted_label="1h ago", search_name="test",
     )
 
 
-def test_build_prompt_includes_profile_and_job_fields():
-    prompt = build_prompt(make_posting(), make_profile())
-    assert "AI Engineer" in prompt
-    assert "Data Engineer" in prompt  # adjacent-tie note
-    assert "Acme" in prompt
-    assert "Prefer product companies over consultancies." in prompt
-
-
-def test_build_prompt_omits_language_note():
-    """The title-only pass has no description to judge language from --
-    observed in production fabricating 'not in English or Spanish' claims
-    about a title alone and dragging down otherwise-fair relevance scores
-    (e.g. 'AI Compute Engineer' at Mistral, scored 2/10 partly on this).
-    Language is already enforced deterministically on the real JD body
-    before this pass ever runs -- see pipeline.py's cascade order."""
-    prompt = build_prompt(make_posting(), make_profile())
-    assert "score it very low" not in prompt
-
-
-def test_build_deep_prompt_includes_language_note():
-    """Unlike the title pass, the deep pass DOES have the real JD text, so
-    the language instruction is legitimate here."""
-    prompt = build_deep_prompt(make_posting(), make_profile(), jd_text="Some JD text.")
-    assert "score it very low" in prompt
-
-
-class _FakeParsed:
-    def __init__(self, score: int, reason: str):
-        self.score = score
-        self.reason = reason
-
-
-class _FakeMessage:
-    def __init__(self, parsed):
-        self.parsed = parsed
-
-
-class _FakeChoice:
-    def __init__(self, parsed, finish_reason: str = "stop"):
-        self.message = _FakeMessage(parsed)
-        self.finish_reason = finish_reason
-
-
-class _FakeCompletion:
-    def __init__(self, parsed, finish_reason: str = "stop"):
-        self.choices = [_FakeChoice(parsed, finish_reason)]
-
-
-def test_score_parses_successful_response(monkeypatch):
-    scorer = OpenAIScorer(api_key="test-key")
-    fake_completion = _FakeCompletion(_FakeParsed(9, "Strong match."))
-    monkeypatch.setattr(scorer._client.beta.chat.completions, "parse", lambda **kw: fake_completion)
-
-    result = scorer.score(make_posting(), make_profile())
-
-    assert result.score == 9
-    assert result.reason == "Strong match."
-    assert result.unscored is False
-    scorer.close()
-
-
-def test_score_fails_open_on_network_error(monkeypatch):
-    scorer = OpenAIScorer(api_key="test-key")
-
-    def boom(**kwargs):
-        raise ConnectionError("no network")
-
-    monkeypatch.setattr(scorer._client.beta.chat.completions, "parse", boom)
-
-    result = scorer.score(make_posting(), make_profile())
-
-    assert result.score is None
-    assert result.unscored is True
-    assert "no network" in result.reason
-    scorer.close()
-
-
-def test_score_fails_open_on_api_error(monkeypatch):
-    scorer = OpenAIScorer(api_key="test-key")
-
-    def boom(**kwargs):
-        raise RuntimeError("rate limited")
-
-    monkeypatch.setattr(scorer._client.beta.chat.completions, "parse", boom)
-
-    result = scorer.score(make_posting(), make_profile())
-
-    assert result.unscored is True
-    scorer.close()
-
-
-def test_score_fails_open_on_refusal(monkeypatch):
-    """A None .parsed (e.g. the model refused, or hit a non-"stop" finish
-    reason like content_filter) must fail open, not raise or crash."""
-    scorer = OpenAIScorer(api_key="test-key")
-    fake_completion = _FakeCompletion(None, finish_reason="content_filter")
-    monkeypatch.setattr(scorer._client.beta.chat.completions, "parse", lambda **kw: fake_completion)
-
-    result = scorer.score(make_posting(), make_profile())
-
-    assert result.score is None
-    assert result.unscored is True
-    scorer.close()
-
-
-# --- deep scoring (step 4: JD fetching + deep scoring) -------------------
-
-
-def test_build_deep_prompt_includes_jd_text_and_title_score_context():
-    prompt = build_deep_prompt(
-        make_posting(),
-        make_profile(),
-        jd_text="We need someone fluent in LangGraph and RAG evaluation.",
-        title_score=4,
-        title_score_reason="Title alone doesn't confirm LLM focus.",
+def deep_payload(**overrides) -> _DeepSchema:
+    fields = dict(
+        requirements=[
+            {"requirement": "Python", "met": True, "evidence": "CV"},
+            {"requirement": "Kubernetes", "met": False, "evidence": "not in CV"},
+        ],
+        years_required=None, is_junior_appropriate=True, location_fit=True,
+        score=8, reason="Confirmed by full JD.",
+        interview_chance_pct=55, chance_reason="Stack fits; no Kubernetes.",
+        role_family=" AI Engineer ", seniority_level="junior", work_mode="remote",
+        contract_type="Permanent", salary_min=40000, salary_max=55000, salary_currency="eur",
+        skills=[
+            {"name": "Python", "category": "language", "required": True, "candidate_has": True},
+            {"name": "  ", "category": "other", "required": False, "candidate_has": False},
+        ],
     )
-    assert "LangGraph and RAG evaluation" in prompt
-    assert "Preliminary title-only score: 4/10" in prompt
-    assert "Title alone doesn't confirm LLM focus." in prompt
-    assert "AI Engineer" in prompt  # profile context still present
+    return _DeepSchema(**{**fields, **overrides})
 
 
-def test_build_deep_prompt_includes_cv_context_when_given():
-    prompt = build_deep_prompt(
-        make_posting(),
-        make_profile(),
-        jd_text="Some JD text.",
-        cv_context="- RAG Assistant with Evaluation Harness",
-    )
-    assert "RAG Assistant with Evaluation Harness" in prompt
+@pytest.fixture
+def scorer():
+    scorer = JobScorer(ClaudeClient(api_key="test-key"), title_model="cheap-model", deep_model="strong-model")
+    yield scorer
+    scorer.close()
 
 
-def test_build_deep_prompt_works_without_optional_context():
-    """title_score and cv_context are both optional -- the cascade may run
-    deep scoring standalone without a preliminary pass or CV facts."""
-    prompt = build_deep_prompt(make_posting(), make_profile(), jd_text="Some JD text.")
-    assert "Some JD text." in prompt
-    assert "Preliminary title-only score" not in prompt
+def stub(scorer, monkeypatch, result):
+    """Make every parse() call return `result` (or raise it), recording the
+    keyword arguments each call was made with."""
+    calls = []
+
+    def fake_parse(**kwargs):
+        calls.append(kwargs)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(scorer._client, "parse", fake_parse)
+    return calls
 
 
-class _FakeReq:
-    def __init__(self, requirement, met):
-        self.requirement, self.met, self.evidence = requirement, met, "because"
+# --- prompts --------------------------------------------------------------
+
+def test_candidate_context_carries_profile_and_location_preferences():
+    context = candidate_context(make_profile())
+    assert "AI Engineer" in context
+    assert "Data Engineer" in context  # adjacent-role note
+    assert "Prefer product companies over consultancies." in context
+    assert "remote from Portugal" in context
+    assert "Maximum years of experience the candidate has: 3" in context
 
 
-class _FakeDeepParsed:
-    def __init__(self, score, reason, requirements, junior=True, years_required=None):
-        self.score, self.reason = score, reason
-        self.requirements = requirements
-        self.years_required = years_required
-        self.is_junior_appropriate = junior
+def test_candidate_context_includes_cv_when_given():
+    assert "Built a RAG assistant" in candidate_context(make_profile(), "- Built a RAG assistant")
+    assert "CV (extracted facts)" not in candidate_context(make_profile())
 
 
-def test_score_deep_parses_successful_response(monkeypatch):
-    scorer = OpenAIScorer(api_key="test-key")
-    parsed = _FakeDeepParsed(8, "Confirmed by full JD.",
-                             [_FakeReq("Python", True), _FakeReq("Kubernetes", False)])
-    monkeypatch.setattr(scorer._client.beta.chat.completions, "parse",
-                        lambda **kw: _FakeCompletion(parsed))
+def test_candidate_context_is_deterministic():
+    """It is the cached prompt prefix: two calls must be byte-identical."""
+    assert candidate_context(make_profile(), "cv") == candidate_context(make_profile(), "cv")
 
-    result = scorer.score_deep(make_posting(), make_profile(), jd_text="Full description here.")
 
-    assert result.score == 8
-    assert result.reason == "Confirmed by full JD."
-    assert result.unscored is False
-    assert result.coverage_pct == 50
-    assert [r.requirement for r in result.matched] == ["Python"]
+def test_title_prompt_holds_only_the_card_fields():
+    prompt = build_title_prompt(make_posting())
+    assert "AI Engineer" in prompt and "Acme" in prompt and "Remote" in prompt
+
+
+def test_deep_prompt_wraps_the_description_and_mentions_the_title_score():
+    prompt = build_deep_prompt(make_posting(), "We need RAG experience.", title_score=6, title_score_reason="Plausible")
+    assert "<job_description>\nWe need RAG experience.\n</job_description>" in prompt
+    assert "6/10" in prompt and "Plausible" in prompt
+
+
+def test_deep_prompt_works_without_a_title_score():
+    assert "Preliminary" not in build_deep_prompt(make_posting(), "JD text.")
+
+
+# --- title pass -----------------------------------------------------------
+
+def test_score_parses_successful_response(scorer, monkeypatch):
+    calls = stub(scorer, monkeypatch, _TitleSchema(score=9, reason="Strong match."))
+
+    result = scorer.score(make_posting(), make_profile())
+
+    assert (result.score, result.reason, result.unscored) == (9, "Strong match.", False)
+    assert calls[0]["model"] == "cheap-model"
+    # The candidate goes in the (cached) system prompt, the job in the user turn.
+    assert "Target roles" in calls[0]["system"] and "Acme" in calls[0]["user"]
+
+
+def test_score_clamps_out_of_range_values(scorer, monkeypatch):
+    stub(scorer, monkeypatch, _TitleSchema(score=42, reason="?"))
+    assert scorer.score(make_posting(), make_profile()).score == 10
+
+
+@pytest.mark.parametrize("error", [ConnectionError("network down"), LLMError("stop_reason=refusal")])
+def test_score_fails_open(scorer, monkeypatch, error):
+    stub(scorer, monkeypatch, error)
+
+    result = scorer.score(make_posting(), make_profile())
+
+    assert result.unscored is True and result.score is None
+    assert "scoring unavailable" in result.reason
+
+
+# --- deep pass ------------------------------------------------------------
+
+def test_score_deep_maps_the_schema_onto_the_result(scorer, monkeypatch):
+    calls = stub(scorer, monkeypatch, deep_payload())
+
+    result = scorer.score_deep(make_posting(), make_profile(), "JD text", cv_context="- RAG project")
+
+    assert calls[0]["model"] == "strong-model"
+    assert "RAG project" in calls[0]["system"]
+    assert result.score == 8 and result.coverage_pct == 50
     assert [r.requirement for r in result.missing] == ["Kubernetes"]
-    scorer.close()
+    assert result.interview_chance_pct == 55
+    assert result.location_fit is True
+    insights = result.insights
+    assert (insights.role_family, insights.contract_type, insights.salary_currency) == ("AI Engineer", "permanent", "EUR")
+    assert [s.name for s in insights.skills] == ["Python"]  # the blank skill is dropped
 
+
+def test_score_deep_plumbs_years_and_location_through(scorer, monkeypatch):
+    stub(scorer, monkeypatch, deep_payload(years_required=5, location_fit=False, interview_chance_pct=140))
+
+    result = scorer.score_deep(make_posting(), make_profile(), "JD text")
+
+    assert result.years_required == 5
+    assert result.location_fit is False
+    assert result.interview_chance_pct == 100  # clamped
+
+
+def test_score_deep_fails_open_on_error(scorer, monkeypatch):
+    stub(scorer, monkeypatch, RuntimeError("boom"))
+
+    result = scorer.score_deep(make_posting(), make_profile(), "JD text")
+
+    assert result.unscored is True
+    assert result.is_junior_appropriate is True and result.location_fit is True  # fail-open defaults
+
+
+# --- coverage -------------------------------------------------------------
 
 def test_coverage_pct_rounds_from_the_requirement_list():
-    from jobradar.scoring import DeepScoreResult, Requirement
-    reqs = tuple(Requirement(f"r{i}", i < 2, "e") for i in range(3))
-    assert DeepScoreResult(score=7, reason="", requirements=reqs).coverage_pct == 67
+    requirements = tuple(Requirement(f"r{i}", met=i < 2, evidence="") for i in range(3))
+    assert DeepScoreResult(score=8, reason="", requirements=requirements).coverage_pct == 67
 
 
 def test_coverage_pct_is_none_when_no_requirements_were_extracted():
-    """An empty list must not read as 0% -- the caller has to be able to
-    tell 'nothing extracted' apart from 'nothing matched'."""
-    from jobradar.scoring import DeepScoreResult
-    assert DeepScoreResult(score=7, reason="").coverage_pct is None
-
-
-def test_deep_result_defaults_to_junior_appropriate():
-    from jobradar.scoring import DeepScoreResult
-    assert DeepScoreResult(score=None, reason="failed", unscored=True).is_junior_appropriate is True
-
-
-def test_score_deep_plumbs_years_required_through(monkeypatch):
-    scorer = OpenAIScorer(api_key="test-key")
-    parsed = _FakeDeepParsed(8, "ok", [_FakeReq("Python", True)], years_required=5)
-    monkeypatch.setattr(scorer._client.beta.chat.completions, "parse", lambda **kw: _FakeCompletion(parsed))
-
-    result = scorer.score_deep(make_posting(), make_profile(), jd_text="Full description here.")
-
-    assert result.years_required == 5
-    scorer.close()
-
-
-def test_build_prompt_states_the_numeric_years_ceiling():
-    """The model needs the exact number, not just the 'entry-to-mid' label,
-    to make an unambiguous is_junior_appropriate call."""
-    prompt = build_prompt(make_posting(), make_profile())
-    assert "Maximum years of experience" in prompt
-    assert "3" in prompt  # make_profile()'s max_years_experience
-
-
-def test_title_and_deep_passes_use_their_configured_models(monkeypatch):
-    scorer = OpenAIScorer(api_key="test-key", model="cheap-model", deep_model="strong-model")
-    seen = []
-
-    def fake_parse(**kw):
-        seen.append(kw["model"])
-        return _FakeCompletion(_FakeDeepParsed(8, "ok", [_FakeReq("Python", True)]))
-
-    monkeypatch.setattr(scorer._client.beta.chat.completions, "parse", fake_parse)
-    scorer.score(make_posting(), make_profile())
-    scorer.score_deep(make_posting(), make_profile(), jd_text="JD")
-
-    assert seen == ["cheap-model", "strong-model"]
-    scorer.close()
-
-
-def test_score_deep_fails_open_on_error(monkeypatch):
-    scorer = OpenAIScorer(api_key="test-key")
-
-    def boom(**kwargs):
-        raise ConnectionError("no network")
-
-    monkeypatch.setattr(scorer._client.beta.chat.completions, "parse", boom)
-
-    result = scorer.score_deep(make_posting(), make_profile(), jd_text="Full description here.")
-
-    assert result.score is None
-    assert result.unscored is True
-    assert "no network" in result.reason
-    scorer.close()
+    assert DeepScoreResult(score=8, reason="").coverage_pct is None

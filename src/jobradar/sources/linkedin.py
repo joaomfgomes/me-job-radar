@@ -29,6 +29,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from jobradar.models import JobPosting, SearchConfig
+from jobradar.sources.base import RateLimitedError
 
 log = logging.getLogger(__name__)
 
@@ -50,13 +51,6 @@ USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
-
-# Raised when the response looks like a block/challenge rather than a normal
-# empty result, so callers can distinguish "no new jobs" from "we got rate
-# limited" and back off accordingly.
-class RateLimitedError(RuntimeError):
-    pass
-
 
 class LinkedInGuestSource:
     def __init__(self, timeout: float = 15.0) -> None:

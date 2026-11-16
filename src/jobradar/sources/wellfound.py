@@ -36,7 +36,7 @@ import httpx
 from bs4 import BeautifulSoup
 
 from jobradar.models import JobPosting, SearchConfig
-from jobradar.sources.linkedin import RateLimitedError
+from jobradar.sources.base import RateLimitedError
 
 log = logging.getLogger(__name__)
 

@@ -1,9 +1,13 @@
 # me-job-radar
 
-Near-real-time job-posting alerts from LinkedIn and Wellfound, scored against
-your CV and delivered to Telegram within minutes of a posting going live --
-so you can apply while it's still fresh, and only hear about the ones worth
-opening.
+Near-real-time job-posting alerts from LinkedIn and Wellfound, matched against
+your CV by Claude and delivered to Telegram within minutes of a posting going
+live -- so you can apply while it's still fresh, and only hear about the ones
+worth opening. Every posting it reads also feeds a small market database:
+which skills are being asked for, and which of them your CV does not show.
+
+New here? [docs/GUIA.md](docs/GUIA.md) walks through the code in Portuguese,
+and [docs/MELHORIAS.md](docs/MELHORIAS.md) lists what is still missing.
 
 The bot introduces itself as **job-radar** in Telegram; the Python package is
 `jobradar`.
@@ -30,7 +34,7 @@ config.yaml   profile.yaml   .env            state.db (SQLite, WAL)
 └──────────────────────────────────────────────────────────────┘
           │                    │                    │
           ▼                    ▼                    ▼
-  LinkedIn / Wellfound     OpenAI API        Telegram Bot API
+  LinkedIn / Wellfound     Claude API        Telegram Bot API
   (no login, no cookies)   (scoring)         (alerts + commands)
 ```
 
@@ -39,26 +43,49 @@ banned. See **Limitations & risks** for what that trade-off means.
 
 ### The evaluation cascade
 
-A new posting is fully evaluated *before* it is alerted. Stages run cheapest
-first, and every stage **fails open**: an infrastructure problem lets the job
-through rather than silently swallowing it.
+A new posting is fully evaluated *before* it is alerted
+([evaluation.py](src/jobradar/evaluation.py)). Stages run cheapest first, and
+every stage that depends on something external **fails open**: an outage lets
+the job through, labelled as not filtered, rather than silently swallowing it.
 
 | # | Stage | Cost | Rejects |
 |---|---|---|---|
 | 1 | Prefilter (`prefilter.py`) | free | Title/employer dealbreakers, seniority terms above your ceiling |
 | 2 | Stated experience | free | Boards that state a years floor above `max_years_experience` |
-| 3 | Description fetch (`sources/linkedin_jd.py`) | 1 request | Nothing -- a failed fetch alerts the job unfiltered, flagged as such |
-| 4 | Language check (`lang_filter.py`) | free | Descriptions not written in a language you read |
-| 5 | Title score (`title_model`) | cheap LLM call | Scores below `deep_score_threshold` |
-| 6 | Deep score (`deep_model`) | stronger LLM call | Years required above your ceiling, not junior-appropriate, or requirement coverage below `min_coverage_pct` |
+| 3 | Title score | 1 small Claude call | Roles that are plainly off-target (below `deep_score_threshold`) |
+| 4 | Description fetch (`sources/linkedin_jd.py`) | 1 request | Nothing -- a failed fetch alerts the job, flagged as unverified |
+| 5 | Language check (`lang_filter.py`) | free | Descriptions not written in a language you read |
+| 6 | Deep score | 1 Claude call | Years above your ceiling, not junior-appropriate, location does not fit `location_preferences`, or requirement coverage below `min_coverage_pct` |
 
-Coverage is computed in Python from the list of must-have requirements the
-model returns, not asked of the model as a number, so the threshold is
-auditable. Jobs held back are still recorded: near-misses go into a daily
-digest and `/rejected` shows the rest.
+The title score runs before the description is fetched so that irrelevant
+titles never cost a LinkedIn request.
 
-Scoring is optional. Without `profile.yaml` or `OPENAI_API_KEY`, every new
-posting is alerted, as in v1.
+The deep pass returns three things in one call ([scoring.py](src/jobradar/scoring.py)):
+
+- **The match.** The posting's must-have requirements, each marked met or
+  unmet against your CV with the evidence. Coverage is computed in Python
+  from that list, not asked of the model as a number, so it is auditable.
+- **The chance.** An estimated probability of getting an interview, anchored
+  to a rubric in the prompt. It is a model estimate -- shown in the alert,
+  never used to decide whether to alert.
+- **Market data.** Skills (required or nice-to-have, on your CV or not), role
+  family, seniority, work mode, contract type and stated salary. Stored for
+  `/market` and `/gaps`.
+
+Jobs held back are still recorded: near-misses go into a daily digest,
+`/rejected` shows the rest, and `/stats` counts where each one stopped.
+
+Filtering degrades in steps. Without `profile.yaml` every new posting is
+alerted. With a profile but no `ANTHROPIC_API_KEY`, only the prefilter runs.
+
+### Models and cost
+
+Both passes default to **Claude Haiku 5.5** (`claude-haiku-5-5`), set by
+`title_model` / `deep_model` in `config.yaml`. The instructions and your
+profile/CV are sent as a cached system prompt; only the posting changes per
+call. At Haiku's prices a deep read of one posting costs a small fraction of
+a cent. To buy a stronger judgment on the deep pass only, set `deep_model`
+to `claude-sonnet-5-5`.
 
 ## Setup
 
@@ -77,7 +104,7 @@ posting is alerted, as in v1.
    ```
 
    Then fill in `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` and, for scoring,
-   `OPENAI_API_KEY`.
+   `ANTHROPIC_API_KEY` (a Claude API key, starting with `sk-ant-`).
 
 4. **Configure your searches:**
 
@@ -96,15 +123,21 @@ posting is alerted, as in v1.
    cp profile.example.yaml profile.yaml
    ```
 
-   To give the deep pass your real project experience to cite, put your CV
-   at `cv.pdf` and run:
+   `location_preferences` is where you say where you can work ("on-site
+   only in Porto; remote from Portugal"). It is the only place location is
+   enforced: LinkedIn's guest search ignores its own remote filter.
+
+   To give the deep pass your real CV to match against, put it at `cv.pdf`
+   and run:
 
    ```bash
    uv run python -m jobradar.cv_ingest
    ```
 
-   This writes `profile.generated.yaml`. Review it; `profile.yaml` stays
-   hand-owned.
+   This writes `profile.generated.yaml` (experience, projects, skills,
+   certifications, education, languages), which the deep pass reads on every
+   call. Review it; `profile.yaml` stays hand-owned. Re-run it whenever the
+   CV changes.
 
 6. **Run it:**
 
@@ -144,11 +177,32 @@ BotFather.
 | `/countries on\|off <name>` | Start or stop searching a location |
 | `/countries add <name>` | Validate a new location against each board, then start searching it |
 | `/countries remove <name>` | Drop a location added via `/countries add` |
+| `/stats [days]` | The funnel: how many jobs were seen, where each was filtered, average coverage and interview chance, best matches |
+| `/market [days]` | What postings ask for: most requested skills (✅ on your CV, ❌ not), work mode, seniority, roles, stated salary |
+| `/gaps [days]` | The most requested skills your CV does not show |
 | `/status` | Uptime, poll health, per-search counts |
 | `/help` | Command list |
 
-Changes made through `/countries` live in `state.db` and take effect on the
-next poll cycle; `config.yaml` is never rewritten.
+`[days]` defaults to 30. Changes made through `/countries` live in `state.db`
+and take effect on the next poll cycle; `config.yaml` is never rewritten. If
+a location exists in both, `config.yaml` wins.
+
+## Statistics and market data
+
+Every posting records where its evaluation ended (`seen_jobs.outcome`), and
+every posting read in full adds a row to `job_insights` and one row per skill
+to `job_skills`. The three commands above are views over those tables; the
+data is plain SQLite, so it can also be queried directly:
+
+```bash
+sqlite3 state.db "SELECT name, COUNT(*) FROM job_skills WHERE candidate_has = 0 GROUP BY skill_key ORDER BY 2 DESC LIMIT 20"
+```
+
+Two things to keep in mind when reading it. Only roles whose title looked
+relevant are read in full, so the market view describes *your target
+market*, not all jobs. And "on your CV" means what `profile.yaml` and
+`profile.generated.yaml` show -- a skill you have but never wrote down
+counts as a gap until you add it.
 
 ## Running it unattended
 
@@ -176,9 +230,13 @@ and nothing else.
 uv run --extra dev pytest
 ```
 
+```bash
+uv run --extra dev ruff check src tests
+```
+
 Everything runs offline. Parsers are tested against real captured responses
 in `tests/fixtures/`, which is what matters most here: the parsers are what
-break when a board changes its markup. The OpenAI and Telegram clients are
+break when a board changes its markup. The Claude and Telegram clients are
 stubbed.
 
 ## Limitations & risks
@@ -195,14 +253,22 @@ stubbed.
   markup, the parser can start returning zero results without erroring.
   Consecutive empty cycles are tracked per search and trigger a Telegram
   warning.
-- **Fail-open means noise when scoring is down.** If the OpenAI call fails
-  (outage, exhausted credits), jobs are alerted unfiltered rather than
-  dropped. A sudden flood of irrelevant alerts usually means scoring is
-  unavailable -- check the log.
+- **Fail-open means noise when scoring is down.** If the Claude call fails
+  (outage, bad key, exhausted credits), jobs are alerted with a "Not
+  filtered" line rather than dropped, and `/stats` says so.
+- **The interview chance is an estimate, not a measurement.** The model
+  follows a rubric, which makes its numbers consistent with each other, but
+  nothing has calibrated them against real outcomes yet.
+- **"Remote" cannot be searched for.** LinkedIn's guest search ignores the
+  workplace filter, so remote roles are found by searching wide (a country,
+  the EU) and letting the deep pass reject what does not fit
+  `location_preferences`. A posting that does not say where it can be done
+  is let through.
 - **Scoring is a model's judgment.** The prefilter and the years ceiling are
-  deterministic; requirement matching is not. Job descriptions are passed to
-  the model as-is, so a posting could in principle be written to game its
-  score; the worst case is one irrelevant alert.
+  deterministic; requirement matching is not. Descriptions are passed to the
+  model as data with an instruction to ignore instructions inside them, but
+  a posting could still be written to game its score; the worst case is one
+  irrelevant alert.
 - **`state.db` grows without retention.** A few MB per month at typical
   volume. It is safe to delete -- the next run re-seeds silently.
 - **Legal/ToS gray area.** This reads publicly visible pages without
@@ -214,6 +280,8 @@ stubbed.
 
 - [x] LLM relevance scoring against `profile.yaml`, enforced before alerting.
 - [x] Second job board (Wellfound).
+- [x] Interview-chance estimate, funnel statistics and a market/skill-gap database.
+- [ ] Record applications and their outcomes, to calibrate the chance estimate.
 - [ ] CI (tests, lint, dependency audit) on pull requests.
 - [ ] Deploy to a small always-on VPS (systemd service) for uptime beyond a
       laptop's battery/sleep cycle.
@@ -228,21 +296,26 @@ src/jobradar/
 ├── logging_setup.py        # rotating, secret-redacting logging
 ├── models.py               # JobPosting, SearchConfig
 ├── profile.py              # profile.yaml loader
-├── pipeline.py             # fetch → dedup → evaluate → notify → record; health
+├── pipeline.py             # one poll cycle: fetch → dedup → evaluate → notify → record
+├── evaluation.py           # the cascade that decides alert vs. hold back
+├── llm.py                  # the only module that calls the Claude API
 ├── prefilter.py            # deterministic dealbreakers
 ├── lang_filter.py          # description language check
-├── scoring.py              # title + deep scoring via OpenAI structured outputs
+├── scoring.py              # prompts and schemas: match, interview chance, market data
 ├── cv_ingest.py            # cv.pdf → profile.generated.yaml (manual tool)
 ├── location_validation.py  # live check that a location resolves on a board
-├── store.py                # SQLite: seen jobs, scores, location prefs
+├── store.py                # SQLite: seen jobs, verdicts, statistics, market data, locations
 ├── notify.py               # Telegram sendMessage / getUpdates
 ├── listener.py             # command long-poll loop
 ├── commands.py             # command handlers (pure, no network)
 └── sources/
-    ├── base.py             # JobSource protocol
+    ├── base.py             # JobSource protocol, RateLimitedError
     ├── linkedin.py         # LinkedIn guest search
     ├── linkedin_jd.py      # LinkedIn guest job description
     └── wellfound.py        # Wellfound (__NEXT_DATA__ Apollo cache)
+docs/
+├── GUIA.md                 # code walkthrough (Portuguese)
+└── MELHORIAS.md            # what could be better / is still missing (Portuguese)
 tests/
 ├── fixtures/               # real captured responses
 └── test_*.py               # offline tests, one file per module

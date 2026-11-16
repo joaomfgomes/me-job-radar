@@ -1,40 +1,20 @@
-"""The fetch -> dedup -> evaluate -> notify -> mark_seen cycle, with backoff
-and a heartbeat.
+"""One poll cycle: fetch -> drop already-seen -> evaluate -> notify -> record.
 
-Ordering: a job is fully evaluated BEFORE it is notified, and only jobs that
-clear the bar are ever sent (see _evaluate). This inverts the original
-notify-first design, which existed to keep alerts near-instant while scoring
-was observation-only. Now that scoring actually decides what gets through,
-notifying first would defeat the point -- and with only a handful of jobs a
-day surviving the filter, the few seconds of added latency cost nothing.
-Notification failures still leave the job unseen so the next cycle retries.
+This module is the orchestration only. The question "should this job be
+alerted?" lives in evaluation.py; this file decides which searches run,
+keeps per-search health counters, and makes sure every posting ends up
+recorded exactly once.
 
-The evaluation is a cascade, cheapest stage first, and every stage FAILS
-OPEN -- an infrastructure problem must never silently swallow a real job:
+Ordering guarantees worth knowing:
 
-  1. prefilter (free, deterministic)  -- title/employer dealbreakers and
-     seniority terms above the candidate's ceiling. Certainties only.
-  2. JD fetch                         -- fetch failure => notify anyway.
-  3. language check (free)            -- description not in a language the
-     candidate reads. Needs the JD body: tech job titles stay in English
-     even when the posting itself doesn't.
-  4. title score (cheap model)        -- below deep_score_threshold, the job
-     is noise; this is the ~87% the deep pass never has to pay for.
-  5. deep score (stronger model)      -- enumerates the posting's must-have
-     requirements and judges each against the CV. Coverage is computed from
-     that list in Python, never asked of the model. Two seniority gates run
-     BEFORE coverage is even considered, and both are strict on purpose (no
-     benefit of the doubt): a JD-stated years_required above
-     max_years_experience is a hard reject regardless of how well the CV
-     otherwise matches (an extracted fact, checked in Python -- not trusted
-     to the model's own judgment); is_junior_appropriate is the model's
-     holistic fallback for postings that read as senior without stating a
-     number. A job is alerted only if it clears both AND
-     coverage >= min_coverage_pct.
-
-Anything scored but held back is still recorded, so nothing disappears
-silently: near-misses (>= digest_min_coverage_pct) are summarized once a
-day by send_digest(), and /rejected shows the rest on demand.
+  * A job is evaluated before it is notified, and only jobs that pass are
+    sent.
+  * A job is marked seen only after its alert was delivered. If Telegram is
+    down the job stays unseen and is retried next cycle -- a duplicate alert
+    is a better failure than a lost one.
+  * Jobs that are held back are recorded as fully as alerted ones, so
+    /rejected, /stats and the daily digest can show what was filtered and
+    why. Nothing disappears silently.
 """
 
 from __future__ import annotations
@@ -43,51 +23,20 @@ import json
 import logging
 import threading
 import time
-from dataclasses import dataclass
 from html import escape
 
 from jobradar.config import Settings, expand_matrix_with_locations
-from jobradar.cv_ingest import format_cv_context
-from jobradar.lang_filter import detect_language_mismatch
+from jobradar.evaluation import Decision, Evaluator, Outcome, Thresholds
 from jobradar.location_validation import validate_location
 from jobradar.models import JobPosting, SearchConfig
 from jobradar.notify import TelegramNotifier
-from jobradar.prefilter import prefilter
 from jobradar.profile import Profile
-from jobradar.scoring import DeepScoreResult, OpenAIScorer
-from jobradar.sources.linkedin import RateLimitedError
+from jobradar.scoring import JobScorer
+from jobradar.sources.base import JobSource, RateLimitedError
 from jobradar.sources.linkedin_jd import JobDescriptionFetcher
 from jobradar.store import Store
 
 log = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class Decision:
-    """Outcome of evaluating one posting. `reason` explains the verdict
-    either way and is what gets stored/shown for suppressed jobs."""
-
-    notify: bool
-    reason: str
-    deep: DeepScoreResult | None = None
-    title_score: int | None = None
-    title_score_reason: str | None = None
-    # True only for notify=True paths that never reached the language check
-    # (no JD text at all -- see _evaluate) -- distinct from title/deep
-    # scoring failing later, where language WAS already verified. Lets the
-    # alert say plainly "this one wasn't screened" instead of silently
-    # possibly showing a job in a language the candidate can't read.
-    language_unverified: bool = False
-
-    @property
-    def score(self) -> int | None:
-        """The score to act on: the deep pass's if it produced one, else the
-        title pass's. Fail-open paths land on the title score rather than
-        None, so a job that slipped through on an API error still carries
-        whatever judgment we did manage to get."""
-        if self.deep is not None and not self.deep.unscored:
-            return self.deep.score
-        return self.title_score
 
 
 class Pipeline:
@@ -95,10 +44,10 @@ class Pipeline:
         self,
         settings: Settings,
         store: Store,
-        sources: dict[str, object],
+        sources: dict[str, JobSource],
         notifier: TelegramNotifier,
         profile: Profile | None = None,
-        scorer: OpenAIScorer | None = None,
+        scorer: JobScorer | None = None,
         jd_fetcher: JobDescriptionFetcher | None = None,
     ) -> None:
         self.settings = settings
@@ -106,13 +55,12 @@ class Pipeline:
         # keyed by SearchConfig.source, so each search runs against its own board
         self.sources = sources
         self.notifier = notifier
-        # profile + scorer must both be set for any filtering to happen at
-        # all; without them the pipeline notifies everything it finds, as it
-        # did before scoring existed. jd_fetcher additionally enables the
-        # language check and the deep pass -- see module docstring.
-        self.profile = profile
-        self.scorer = scorer
-        self.jd_fetcher = jd_fetcher
+        # Without a profile nothing is filtered; without a scorer only the
+        # deterministic prefilter runs. See evaluation.py.
+        self.evaluator = Evaluator(
+            profile, scorer, jd_fetcher,
+            Thresholds(settings.deep_score_threshold, settings.min_coverage_pct),
+        )
         # per-search health tracking, kept in memory (resets on restart -- fine)
         self._consecutive_errors: dict[str, int] = {}
         self._consecutive_empty: dict[str, int] = {}
@@ -122,34 +70,47 @@ class Pipeline:
         self._health_lock = threading.Lock()
         self.last_poll_at: float | None = None
         self.last_success_at: float | None = None
-        # query expansion (step 3): round-robin cursor into secondary_searches,
+        # round-robin cursor into secondary_searches,
         # resets on restart -- harmless, just starts the rotation over
         self._secondary_rotation_index = 0
 
     def run_cycle(self) -> None:
         with self._health_lock:
             self.last_poll_at = time.time()
-        core, secondary = self.current_searches()
-        disabled = self._disabled_locations()
+        core, secondary = self.active_searches()
         for search in core + self._next_secondary_batch(secondary):
-            if search.location_name in disabled:
-                continue
             try:
                 self._run_search(search)
             except Exception:
-                # Isolation: one search blowing up past its own handlers (a
-                # DB error, a parser edge case mid-evaluation) must not cost
-                # every other search its turn this cycle.
+                # Isolation: one search failing past its own handlers (a DB
+                # error, a parser edge case) must not cost every other
+                # search its turn this cycle.
                 log.exception("Unexpected error while running search '%s'", search.name)
+
+    def active_searches(self) -> tuple[list[SearchConfig], list[SearchConfig]]:
+        """current_searches() minus paused locations. Dropping them before
+        the rotation picks its batch means a paused location never uses up
+        one of the cycle's slots."""
+        core, secondary = self.current_searches()
+        disabled = self._disabled_locations()
+        return (
+            [s for s in core if s.location_name not in disabled],
+            [s for s in secondary if s.location_name not in disabled],
+        )
 
     def current_searches(self) -> tuple[list[SearchConfig], list[SearchConfig]]:
         """Re-expands the search matrix every cycle against config.yaml's
         locations PLUS anything added at runtime via /countries add, so a
         newly-added location is searched on the very next cycle -- no
         restart. Cheap: pure dict iteration, no I/O."""
-        custom = self.store.custom_locations()
-        locations = list(self.settings.matrix_locations) + [
-            {"name": name, **queries} for name, queries in custom.items()
+        configured = list(self.settings.matrix_locations)
+        configured_names = {loc["name"].lower() for loc in configured}
+        # config.yaml wins on a name clash: a location added from Telegram
+        # and later written into config.yaml must not be searched twice.
+        locations = configured + [
+            {"name": name, **queries}
+            for name, queries in self.store.custom_locations().items()
+            if name.lower() not in configured_names
         ]
         matrix_core, matrix_secondary = expand_matrix_with_locations(locations, self.settings.matrix_sources)
         return (
@@ -236,7 +197,7 @@ class Pipeline:
             self._process(p)
 
     def _process(self, posting: JobPosting) -> None:
-        decision = self._evaluate(posting)
+        decision = self.evaluator.evaluate(posting)
 
         if not decision.notify:
             log.info("'%s': held back (%s)", posting.title, decision.reason)
@@ -244,11 +205,15 @@ class Pipeline:
             self._record(posting, decision)
             return
 
-        if self.notifier.send_job(
-            posting, score=decision.score, deep=decision.deep, language_unverified=decision.language_unverified
-        ) is None:
-            # Leave it unseen so the next cycle retries -- a duplicate alert
-            # is a better failure than a dropped job.
+        delivered = self.notifier.send_job(
+            posting,
+            score=decision.score,
+            deep=decision.deep,
+            language_unverified=decision.language_unverified,
+            unfiltered_reason=decision.reason if decision.outcome is Outcome.UNFILTERED else None,
+        )
+        if delivered is None:
+            # Leave it unseen so the next cycle retries.
             log.error("Notify failed for job %s ('%s') -- will retry next cycle", posting.job_id, posting.title)
             return
 
@@ -258,132 +223,33 @@ class Pipeline:
         log.info("'%s': ALERTED (%s)", posting.title, decision.reason)
 
     def _record(self, posting: JobPosting, decision: Decision) -> None:
-        """Persist whatever the cascade managed to determine, however far it
-        got -- suppressed jobs are recorded just as fully as alerted ones so
-        /rejected and the digest have something to show."""
+        """Persist whatever the cascade determined, however far it got."""
+        key = posting.dedup_key
+        self.store.set_outcome(key, decision.outcome.value)
         if decision.title_score is not None:
-            self.store.set_title_score(posting.dedup_key, decision.title_score, decision.title_score_reason or "")
+            self.store.set_title_score(key, decision.title_score, decision.title_score_reason or "")
 
         deep = decision.deep
-        if deep is not None and not deep.unscored:
-            self.store.set_deep_result(
-                posting.dedup_key,
-                score=deep.score,
-                reason=deep.reason,
-                coverage_pct=deep.coverage_pct,
-                requirements_json=json.dumps([
-                    {"requirement": r.requirement, "met": r.met, "evidence": r.evidence}
-                    for r in deep.requirements
-                ]),
-                is_junior_appropriate=deep.is_junior_appropriate,
-            )
-            self.store.set_score(posting.dedup_key, deep.score, decision.reason)
-        else:
-            self.store.set_score(posting.dedup_key, decision.title_score, decision.reason)
+        if deep is None or deep.unscored:
+            self.store.set_score(key, decision.title_score, decision.reason)
+            return
 
-    def _evaluate(self, posting: JobPosting) -> Decision:
-        """Runs the cascade described in the module docstring. Every failure
-        path returns notify=True: we would rather send a job that turns out
-        to be irrelevant than drop one because an API call timed out."""
-        if self.profile is None or self.scorer is None:
-            return Decision(notify=True, reason="scoring disabled")
-
-        pre = prefilter(posting, self.profile)
-        if not pre.passed:
-            return Decision(notify=False, reason=f"prefilter: {pre.reason}")
-
-        # Some boards state the experience floor outright (Wellfound does).
-        # When they do it's a fact, not an inference, so it settles seniority
-        # before any model is asked -- and costs nothing.
-        ceiling = self.profile.max_years_experience
-        stated = posting.years_experience_min
-        if ceiling is not None and stated is not None and stated > ceiling:
-            return Decision(notify=False, reason=f"posting requires {stated}+ years, above the {ceiling}-year ceiling")
-
-        # A board that returns the description with the search result spares
-        # us a whole extra request -- and the stages below need that text
-        # regardless of where it came from.
-        jd_text = posting.description
-        if jd_text is None and self.jd_fetcher is None:
-            # Title-only mode: no description to check language or
-            # requirements against, so the title score is all we have.
-            title = self.scorer.score(posting, self.profile)
-            return Decision(
-                notify=True,
-                reason="no JD fetcher configured -- title score only",
-                title_score=title.score,
-                title_score_reason=title.reason,
-                language_unverified=True,
-            )
-
-        if jd_text is None:
-            jd_text = self.jd_fetcher.fetch(posting.job_id)
-        if jd_text is None:
-            return Decision(notify=True, reason="JD fetch failed -- alerted unfiltered", language_unverified=True)
-
-        mismatch = detect_language_mismatch(jd_text, self.profile.languages)
-        if mismatch:
-            return Decision(notify=False, reason=f"language: {mismatch}")
-
-        title = self.scorer.score(posting, self.profile)
-        if title.unscored:
-            return Decision(
-                notify=True,
-                reason=f"title scoring failed -- alerted unfiltered ({title.reason})",
-                title_score=None,
-                title_score_reason=title.reason,
-            )
-        if title.score < self.settings.deep_score_threshold:
-            return Decision(
-                notify=False,
-                reason=f"title score {title.score}/10 below deep threshold: {title.reason}",
-                title_score=title.score,
-                title_score_reason=title.reason,
-            )
-
-        deep = self.scorer.score_deep(
-            posting,
-            self.profile,
-            jd_text,
-            title_score=title.score,
-            title_score_reason=title.reason,
-            cv_context=format_cv_context(),  # None if profile.generated.yaml is absent -- fine
+        self.store.set_deep_result(
+            key,
+            score=deep.score,
+            reason=deep.reason,
+            coverage_pct=deep.coverage_pct,
+            requirements_json=json.dumps([
+                {"requirement": r.requirement, "met": r.met, "evidence": r.evidence}
+                for r in deep.requirements
+            ]),
+            is_junior_appropriate=deep.is_junior_appropriate,
+            interview_chance_pct=deep.interview_chance_pct,
+            chance_reason=deep.chance_reason,
         )
-        return self._judge_deep(deep, title.score, title.reason)
-
-    def _judge_deep(self, deep: DeepScoreResult, title_score: int, title_reason: str) -> Decision:
-        common = {"deep": deep, "title_score": title_score, "title_score_reason": title_reason}
-
-        if deep.unscored:
-            return Decision(notify=True, reason=f"deep scoring failed -- alerted unfiltered ({deep.reason})", **common)
-
-        # Enforced as an extracted fact, not the model's is_junior_appropriate
-        # judgment call below -- "4+ years" in the JD means 4+ years, full
-        # stop, no interpretation. Checked first because it's the least
-        # ambiguous signal available.
-        ceiling = self.profile.max_years_experience
-        if deep.years_required is not None and ceiling is not None and deep.years_required > ceiling:
-            return Decision(
-                notify=False,
-                reason=f"posting requires {deep.years_required}+ years (JD-stated), above the {ceiling}-year ceiling",
-                **common,
-            )
-
-        if not deep.is_junior_appropriate:
-            return Decision(notify=False, reason=f"not junior-appropriate: {deep.reason}", **common)
-
-        coverage = deep.coverage_pct
-        if coverage is None:
-            # Model returned no requirements at all -- treating that as 0%
-            # would suppress on a modelling artefact, so fail open instead.
-            # (Seniority was already ruled out above -- this fail-open path
-            # only concerns the coverage judgment, not the hard senior gate.)
-            return Decision(notify=True, reason="no requirements extracted -- alerted unfiltered", **common)
-
-        if coverage < self.settings.min_coverage_pct:
-            return Decision(notify=False, reason=f"{coverage}% requirement coverage, below {self.settings.min_coverage_pct}%", **common)
-
-        return Decision(notify=True, reason=f"{coverage}% requirement coverage", **common)
+        self.store.set_score(key, deep.score, decision.reason)
+        if deep.insights is not None:
+            self.store.save_insights(key, deep.insights)
 
     def validate_and_add_location(self, name: str) -> str:
         """Runs live validation (location_validation.validate_location)

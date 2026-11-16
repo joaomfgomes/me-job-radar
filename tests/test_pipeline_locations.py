@@ -90,6 +90,34 @@ def test_a_location_added_via_the_store_is_searched_without_restart(store):
     assert {s.location_name for s in after} == {"Madrid", "Lisbon"}
 
 
+def test_config_location_wins_over_a_custom_one_with_the_same_name(store):
+    """A location added from Telegram and later written into config.yaml
+    must not be searched twice."""
+    pipeline = make_pipeline(store, make_settings())
+    store.add_custom_location("madrid", {"linkedin": "Madrid, Spain"})
+
+    core, _ = pipeline.current_searches()
+
+    assert [s.location for s in core] == ["Madrid"]
+
+
+def test_paused_locations_do_not_use_up_rotation_slots(store):
+    settings = make_settings(matrix_locations=[
+        {"name": "Madrid", "linkedin": "Madrid"}, {"name": "Lisbon", "linkedin": "Lisbon"},
+    ], secondary_batch_size=1)
+    source = FakeValidatingSource()
+    calls = []
+    source.fetch = lambda search: calls.append(search.name) or []
+    pipeline = Pipeline(settings, store, {"linkedin": source}, FakeNotifier())
+    store.set_location_enabled("Lisbon", False)
+
+    pipeline.run_cycle()
+    pipeline.run_cycle()
+
+    assert all("Lisbon" not in name for name in calls)
+    assert calls.count("LLM Engineer - Madrid (linkedin)") == 2  # its slot every cycle
+
+
 def test_removed_custom_location_disappears_from_the_next_cycle(store):
     settings = make_settings()
     pipeline = make_pipeline(store, settings)

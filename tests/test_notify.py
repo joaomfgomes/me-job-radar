@@ -203,3 +203,21 @@ def test_send_job_omits_link_when_url_is_not_http(notifier, monkeypatch):
     captured = capture(notifier, monkeypatch)
     notifier.send_job(make_posting(url="javascript:alert(1)"))
     assert "<a href" not in captured["json"]["text"]
+
+
+def test_send_job_shows_the_interview_chance_as_an_estimate(notifier, monkeypatch):
+    captured = capture(notifier, monkeypatch)
+    notifier.send_job(make_posting(), deep=make_deep(chance=72))
+
+    text = captured["json"]["text"]
+    assert "~72% (estimate)" in text
+    assert "remote" in text  # work mode from the extracted insights
+
+
+def test_send_job_labels_a_fail_open_alert(notifier, monkeypatch):
+    """Without this an API outage looks like a flood of bad matches."""
+    captured = capture(notifier, monkeypatch)
+    notifier.send_job(make_posting(), unfiltered_reason="title scoring failed (HTTP 401)")
+
+    assert "Not filtered" in captured["json"]["text"]
+    assert "HTTP 401" in captured["json"]["text"]

@@ -35,6 +35,10 @@ class Profile:
     adjacent_roles_require_llm_tie: list[str]
     dealbreakers: Dealbreakers
     notes: str = ""
+    # Free text describing where the candidate can work ("on-site only in
+    # Porto; remote from Portugal"). Given to the deep pass, which answers
+    # location_fit against it. Empty disables the location gate.
+    location_preferences: str = ""
 
 
 def load_profile(path: str | Path = "profile.yaml") -> Profile:
@@ -58,4 +62,5 @@ def load_profile(path: str | Path = "profile.yaml") -> Profile:
         adjacent_roles_require_llm_tie=raw.get("adjacent_roles_require_llm_tie") or [],
         dealbreakers=dealbreakers,
         notes=raw.get("notes") or "",
+        location_preferences=raw.get("location_preferences") or "",
     )

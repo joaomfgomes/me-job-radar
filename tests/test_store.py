@@ -85,7 +85,6 @@ def test_rejected_jobs_respects_the_limit(store):
 
 
 def test_rejected_jobs_orders_newest_first(store):
-    import time
     seed(store, "0", coverage=50)
     store._conn.execute("UPDATE seen_jobs SET first_seen = '2020-01-01 00:00:00'")
     seed(store, "1", coverage=50)  # inserted after, with a real (later) timestamp

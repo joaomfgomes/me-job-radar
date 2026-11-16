@@ -56,7 +56,9 @@ searches:
     keywords: "Python Backend Engineer"
     location: "European Union"
     time_posted_seconds: 1800
-    workplace_type: "2"              # 1=on-site, 2=remote, 3=hybrid (omit for all)
+    # workplace_type ("1" on-site, "2" remote, "3" hybrid) is passed to
+    # LinkedIn but its guest search appears to ignore it. To target remote
+    # roles, describe what you accept in profile.yaml's location_preferences.
 
 secondary_searches: []
 
@@ -67,17 +69,17 @@ pipeline:
   log_path: "jobradar.log"
   consecutive_error_alert_threshold: 3    # alert after N back-to-back fetch failures (rate limit etc.)
   consecutive_empty_alert_threshold: 24   # alert after N back-to-back zero-result cycles (~4h @ 10min) -- likely a broken parser
-  profile_path: "profile.yaml"            # optional: enables scoring/enforcement if this file exists and OPENAI_API_KEY is set (see profile.example.yaml)
+  profile_path: "profile.yaml"            # optional: enables scoring if this file exists and ANTHROPIC_API_KEY is set (see profile.example.yaml)
   secondary_batch_size: 2                 # how many secondary searches to poll per cycle (rotates through the rest)
 
-  # Enforcement (step 6): a job is only alerted once its full description has
-  # been deep-scored AND at least min_coverage_pct of its must-have
-  # requirements are covered by the CV/profile, AND it's judged
-  # junior-appropriate. Coverage is computed from the requirement list the
+  # A job is only alerted once its full description has been read AND at
+  # least min_coverage_pct of its must-have requirements are covered by the
+  # CV/profile, AND it is junior-appropriate, AND its location fits. Coverage is computed from the requirement list the
   # model returns, not asked of it directly -- see scoring.py.
   deep_score_threshold: 4                 # title-only score >= this triggers the deep (JD-based) pass
   min_coverage_pct: 80                    # alert bar
   digest_min_coverage_pct: 60             # near-misses [this, min_coverage_pct) go in the daily digest instead of silence
   digest_hour: 9                          # local hour the daily digest sends
-  title_model: "gpt-4o-mini"              # cheap first pass -- runs on every notified job
-  deep_model: "gpt-4o"                    # requirement-by-requirement pass -- only the ~10-15% that clear deep_score_threshold
+  title_model: "claude-haiku-5-5"         # first pass, title only -- runs on every job that clears the prefilter
+  deep_model: "claude-haiku-5-5"          # full-description pass -- only jobs that clear deep_score_threshold.
+                                          # Set to "claude-sonnet-5-5" for a stronger (costlier) judgment.
