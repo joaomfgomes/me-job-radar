@@ -1,20 +1,19 @@
-"""Telegram notifications via the Bot API (sendMessage, HTTP POST, no SDK needed).
+"""Telegram notifications via the Bot API (plain HTTP, no SDK needed).
 
-A job is fully evaluated before it reaches here (see evaluation.py), so a message is built once, with its verdict already known --
-there is no second pass that revises an alert after the fact.
+A job is fully evaluated before it reaches here (see evaluation.py), so each
+message is built once, with its verdict already known.
 
 Two shapes of job message:
-  * evaluated -- a deep result exists, so the header leads with the CV
-    coverage percentage and the body lists which of the posting's must-have
-    requirements are met and which aren't. That brief is the actual point of
-    the alert: it says why this job is worth opening.
-  * unevaluated -- a fail-open path let the job through without a deep
-    result (JD fetch failed, scoring disabled/unavailable). Falls back to a
-    plain header with no coverage claim, because there honestly isn't one.
-    When the reason is specifically "no description was ever available"
-    (language_unverified=True), that's called out explicitly -- unlike a
-    missing coverage score, a missed language check is a real risk the
-    candidate asked to be warned about, not just a lower-confidence match.
+  * evaluated  -- the deep pass read the posting. The header leads with the
+    CV coverage, followed by the interview-chance estimate and the list of
+    must-have requirements met and missing. That brief is the point of the
+    alert: it says why the job is worth opening.
+  * unfiltered -- a fail-open path let the job through (description or model
+    unavailable). No coverage is claimed, and a "Not filtered" warning says
+    why, so an outage does not look like a run of bad matches.
+
+Messages use parse_mode=HTML: everything that came from a job board or from
+the model goes through escape(), and links are only built for http(s) URLs.
 """
 
 from __future__ import annotations
@@ -116,8 +115,7 @@ class TelegramNotifier:
         posting: JobPosting,
         score: int | None = None,
         deep: DeepScoreResult | None = None,
-        language_unverified: bool = False,
-        unfiltered_reason: str | None = None,
+        warnings: tuple[str, ...] = (),
     ) -> str:
         coverage = deep.coverage_pct if deep is not None and not deep.unscored else None
 
@@ -133,16 +131,7 @@ class TelegramNotifier:
             f"Source: {escape(posting.source)} · {escape(posting.search_name)}",
         ]
 
-        if language_unverified:
-            # The one notify=True path where the language check never ran at
-            # all (no description available) -- say so plainly rather than
-            # let a possibly-wrong-language posting look like any other.
-            lines.append("⚠️ Description unavailable — language not verified, check before assuming it's English/Spanish")
-
-        if unfiltered_reason and not language_unverified:
-            # A fail-open alert: say so, or an outage looks like a flood of
-            # bad matches.
-            lines.append(f"⚠️ Not filtered — {escape(unfiltered_reason[:200])}")
+        lines += [f"⚠️ {escape(warning[:200])}" for warning in warnings]
 
         if deep is not None and not deep.unscored:
             if deep.interview_chance_pct is not None:
@@ -172,15 +161,12 @@ class TelegramNotifier:
         posting: JobPosting,
         score: int | None = None,
         deep: DeepScoreResult | None = None,
-        language_unverified: bool = False,
-        unfiltered_reason: str | None = None,
+        warnings: tuple[str, ...] = (),
     ) -> int | None:
         """Returns the Telegram message_id on success, or None on failure --
-        the pipeline treats None as 'not delivered' and retries next cycle."""
-        return self._send(self._format_job_text(
-            posting, score=score, deep=deep,
-            language_unverified=language_unverified, unfiltered_reason=unfiltered_reason,
-        ))
+        the pipeline treats None as 'not delivered' and retries next cycle.
+        Each warning is shown on its own line, flagged with ⚠️."""
+        return self._send(self._format_job_text(posting, score, deep, warnings))
 
     def send_digest(self, rows: list[dict], threshold: int) -> bool:
         """One daily message for near-misses: jobs worth knowing about but

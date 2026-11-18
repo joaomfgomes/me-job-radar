@@ -22,12 +22,8 @@ def add_job(store, job_id, outcome, *, coverage=None, chance=None, notified=Fals
         url=f"https://example.com/{job_id}", posted_label="1h ago", search_name="Search A",
     )
     store.mark_seen(posting)
-    store.set_outcome(posting.dedup_key, outcome)
-    if coverage is not None:
-        store.set_deep_result(posting.dedup_key, 8, "ok", coverage, "[]", True,
-                              interview_chance_pct=chance, chance_reason="why")
-    if notified:
-        store.set_notified(posting.dedup_key)
+    store.record_verdict(posting.dedup_key, outcome=outcome, reason="why", notified=notified,
+                         coverage_pct=coverage, interview_chance_pct=chance)
     if insights is not None:
         store.save_insights(posting.dedup_key, insights)
 

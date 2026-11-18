@@ -1,12 +1,13 @@
-"""Direct tests for Store methods not already exercised through the
-pipeline evaluation tests: digest candidate selection, rejection listing,
-location preferences, and the multi-source dedup key.
-"""
+"""Store behaviour not already exercised through the pipeline tests: the
+dedup key, verdict recording, the digest's selection, the rejected list,
+and upgrading an older database file."""
+
+import sqlite3
 
 import pytest
 
 from jobradar.models import JobPosting
-from jobradar.store import Store
+from jobradar.store import Store, title_key
 
 
 @pytest.fixture
@@ -16,126 +17,118 @@ def store(tmp_path):
     s.close()
 
 
-def seed(store, job_id, source="linkedin", coverage=None, junior=True, notified=False, digest_sent=False):
-    p = JobPosting(job_id=job_id, title=f"Job {job_id}", company="Acme", location="Remote",
-                    url=f"https://x/{job_id}", posted_label="1h", search_name="s", source=source)
-    store.mark_seen(p)
-    if coverage is not None:
-        store.set_deep_result(p.dedup_key, score=5, reason="r", coverage_pct=coverage,
-                              requirements_json="[]", is_junior_appropriate=junior)
-        store.set_score(p.dedup_key, 5, "r")
-    if notified:
-        store.set_notified(p.dedup_key)
-    if digest_sent:
-        store.mark_digest_sent([p.dedup_key])
-    return p
+def seed(store, job_id, source="linkedin", outcome="low_coverage", coverage=None, notified=False):
+    posting = JobPosting(job_id=job_id, title=f"Job {job_id}", company="Acme", location="Porto",
+                         url=f"https://x/{job_id}", posted_label="1h", search_name="s", source=source)
+    store.mark_seen(posting)
+    store.record_verdict(posting.dedup_key, outcome=outcome, reason="r", notified=notified, coverage_pct=coverage)
+    return posting
 
 
 def test_dedup_key_namespaces_by_source(store):
-    """The same numeric id from two different boards must not collide."""
-    a = seed(store, "1", source="linkedin")
-    b = seed(store, "1", source="wellfound")
-    assert a.dedup_key != b.dedup_key
-    assert store._conn.execute("SELECT COUNT(*) FROM seen_jobs").fetchone()[0] == 2
+    seed(store, "1", source="linkedin")
+    same_id_other_board = JobPosting("1", "T", "C", "L", "https://x", "1h", "s", source="wellfound")
+
+    assert store.filter_unseen([same_id_other_board]) == [same_id_other_board]
 
 
-def test_digest_candidates_respects_the_percentage_window(store):
-    seed(store, "1", coverage=55)   # below the window
-    seed(store, "2", coverage=60)   # window's lower bound, inclusive
-    seed(store, "3", coverage=79)   # window's upper bound, exclusive of max
-    seed(store, "4", coverage=80)   # at/above min_coverage_pct -- would have been alerted, not a near-miss
-
-    rows = store.digest_candidates(min_pct=60, max_pct=80)
-    assert {r["job_id"].split(":")[-1] for r in rows} == {"2", "3"}
+def test_seeding_is_tracked_per_search(store):
+    assert store.is_seeded("Search A") is False
+    store.mark_seeded("Search A")
+    assert store.is_seeded("Search A") is True and store.is_seeded("Search B") is False
 
 
-def test_digest_candidates_excludes_notified_and_already_digested(store):
-    seed(store, "1", coverage=65, notified=True)     # already alerted
-    seed(store, "2", coverage=65, digest_sent=True)   # already digested once
-    seed(store, "3", coverage=65)                     # the only real candidate
+def test_record_verdict_stores_requirements_as_json(store):
+    posting = seed(store, "1")
+    store.record_verdict(posting.dedup_key, outcome="alerted", reason="80%", notified=True, coverage_pct=80,
+                         requirements=[{"requirement": "Python", "met": True, "evidence": "CV"}])
 
-    rows = store.digest_candidates(min_pct=60, max_pct=80)
-    assert [r["job_id"].split(":")[-1] for r in rows] == ["3"]
-
-
-def test_digest_candidates_excludes_senior_inappropriate_near_misses(store):
-    seed(store, "1", coverage=65, junior=False)
-    seed(store, "2", coverage=65, junior=True)
-    rows = store.digest_candidates(min_pct=60, max_pct=80)
-    assert [r["job_id"].split(":")[-1] for r in rows] == ["2"]
+    row = store._conn.execute("SELECT outcome, notified, requirements_json FROM seen_jobs").fetchone()
+    assert row == ("alerted", 1, '[{"requirement": "Python", "met": true, "evidence": "CV"}]')
 
 
-def test_digest_candidates_excludes_jobs_that_never_reached_the_deep_pass(store):
-    seed(store, "1")  # no coverage_pct at all -- e.g. prefiltered
-    assert store.digest_candidates(min_pct=0, max_pct=100) == []
+def test_digest_takes_only_near_misses_inside_the_window(store):
+    seed(store, "low", coverage=59)
+    seed(store, "in", coverage=60)
+    seed(store, "top", coverage=79)
+    seed(store, "above", coverage=80)
+
+    assert [r["title"] for r in store.digest_candidates(60, 80)] == ["Job top", "Job in"]
 
 
-def test_mark_digest_sent_is_idempotent(store):
-    p = seed(store, "1", coverage=65)
-    store.mark_digest_sent([p.dedup_key])
-    store.mark_digest_sent([p.dedup_key])  # must not raise
-    assert store.digest_candidates(min_pct=60, max_pct=80) == []
+def test_digest_excludes_jobs_held_back_for_other_reasons(store):
+    """A 70%-coverage job rejected for seniority or location is not a near
+    miss: raising or lowering the coverage bar would not have changed it."""
+    seed(store, "senior", outcome="not_junior", coverage=70)
+    seed(store, "elsewhere", outcome="location", coverage=70)
+    seed(store, "prefiltered", outcome="prefilter")
+
+    assert store.digest_candidates(60, 80) == []
 
 
-def test_rejected_jobs_respects_the_limit(store):
-    for i in range(5):
-        seed(store, str(i), coverage=50)
-    assert len(store.rejected_jobs(limit=2)) == 2
-    assert len(store.rejected_jobs(limit=10)) == 5
+def test_a_job_is_digested_at_most_once(store):
+    posting = seed(store, "1", coverage=70)
+    store.mark_digest_sent([posting.dedup_key])
+    store.mark_digest_sent([posting.dedup_key])
+
+    assert store.digest_candidates(60, 80) == []
 
 
-def test_rejected_jobs_orders_newest_first(store):
-    seed(store, "0", coverage=50)
-    store._conn.execute("UPDATE seen_jobs SET first_seen = '2020-01-01 00:00:00'")
-    seed(store, "1", coverage=50)  # inserted after, with a real (later) timestamp
-    rows = store.rejected_jobs(limit=10)
-    assert rows[0]["job_id"] == "linkedin:1"
+def test_rejected_jobs_are_newest_first_and_exclude_alerts(store):
+    seed(store, "old", coverage=50)
+    seed(store, "sent", outcome="alerted", coverage=90, notified=True)
+    seed(store, "new", coverage=50)
+
+    assert [r["title"] for r in store.rejected_jobs()] == ["Job new", "Job old"]
+    assert len(store.rejected_jobs(limit=1)) == 1
 
 
-def test_rejected_jobs_excludes_alerted_jobs(store):
-    seed(store, "1", coverage=90, notified=True)
+def test_rejected_jobs_exclude_seeded_rows(store):
+    """Rows recorded by first-run seeding were never evaluated, so they were
+    not 'held back'."""
+    store.mark_seen(JobPosting("9", "T", "C", "L", "https://x", "1h", "s"))
     assert store.rejected_jobs() == []
 
 
-def test_location_prefs_defaults_to_absent_meaning_enabled(store):
-    assert store.location_prefs() == {}  # nothing toggled -> caller treats absence as enabled
+def test_an_older_database_is_upgraded_in_place(tmp_path):
+    """A state.db from the first release has only the original columns."""
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute("""CREATE TABLE seen_jobs (job_id TEXT PRIMARY KEY, title TEXT NOT NULL, company TEXT NOT NULL,
+                    search_name TEXT NOT NULL, first_seen TEXT NOT NULL DEFAULT (datetime('now')))""")
+    conn.execute("INSERT INTO seen_jobs (job_id, title, company, search_name) VALUES ('linkedin:1', 'T', 'C', 's')")
+    conn.commit()
+    conn.close()
+
+    store = Store(path)
+    store.record_verdict("linkedin:1", outcome="alerted", reason="r", notified=True)
+
+    assert store.total_count() == 1
+    assert store.outcome_counts(days=1) == {"alerted": 1}
+    store.close()
 
 
-def test_set_location_enabled_is_idempotent_and_updates_in_place(store):
-    store.set_location_enabled("Germany", False)
-    store.set_location_enabled("Germany", True)
-    assert store.location_prefs() == {"Germany": True}
+@pytest.mark.parametrize("variant", [
+    "AI Engineer", "ai engineer", "AI Engineer (m/f/d)", "AI Engineer [F/M/X]", "AI Engineer (f/m/div.)", "AI-Engineer",
+])
+def test_title_key_ignores_case_punctuation_and_gender_markers(variant):
+    assert title_key(variant) == "ai engineer"
 
 
-# --- custom_locations (runtime-added via /countries add) -----------------
+def test_title_key_keeps_words_that_change_the_job():
+    assert title_key("Junior AI Engineer") != title_key("AI Engineer")
 
 
-def test_custom_locations_starts_empty(store):
-    assert store.custom_locations() == {}
+def test_find_repost_ignores_jobs_outside_the_window(store):
+    old = seed(store, "1")
+    store._conn.execute("UPDATE seen_jobs SET first_seen = datetime('now', '-40 days')")
+    repost = JobPosting("2", old.title, old.company, "Porto", "https://x/2", "1h", "s")
+
+    assert store.find_repost(repost, days=30) is None
+    assert store.find_repost(repost, days=60)["outcome"] == "low_coverage"
 
 
-def test_add_custom_location_persists_per_source_queries(store):
-    store.add_custom_location("Lisbon", {"linkedin": "Lisbon", "wellfound": "lisbon"})
-    assert store.custom_locations() == {"Lisbon": {"linkedin": "Lisbon", "wellfound": "lisbon"}}
-
-
-def test_add_custom_location_is_upsert(store):
-    store.add_custom_location("Lisbon", {"linkedin": "Lisbon"})
-    store.add_custom_location("Lisbon", {"linkedin": "Lisbon", "wellfound": "lisbon"})
-    assert store.custom_locations() == {"Lisbon": {"linkedin": "Lisbon", "wellfound": "lisbon"}}
-
-
-def test_remove_custom_location_reports_whether_it_existed(store):
-    store.add_custom_location("Lisbon", {"linkedin": "Lisbon"})
-    assert store.remove_custom_location("Lisbon") is True
-    assert store.remove_custom_location("Lisbon") is False
-    assert store.custom_locations() == {}
-
-
-def test_remove_custom_location_also_clears_its_prefs(store):
-    """Otherwise a removed-then-re-added location could silently inherit a
-    stale on/off state from before it was removed."""
-    store.add_custom_location("Lisbon", {"linkedin": "Lisbon"})
-    store.set_location_enabled("Lisbon", False)
-    store.remove_custom_location("Lisbon")
-    assert store.location_prefs() == {}
+def test_reposts_are_left_out_of_the_rejected_list(store):
+    seed(store, "1")
+    seed(store, "2", outcome="repost")
+    assert [r["title"] for r in store.rejected_jobs()] == ["Job 1"]

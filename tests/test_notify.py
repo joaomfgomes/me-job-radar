@@ -60,25 +60,6 @@ def test_send_job_with_deep_result_leads_with_coverage_and_brief(notifier, monke
     assert "🆕" not in text
 
 
-def test_send_job_with_language_unverified_shows_warning(notifier, monkeypatch):
-    """The exact failure mode found in production: a JD fetch failure skips
-    the language check entirely, and the alert must say so plainly rather
-    than look like a normally-screened job."""
-    captured = capture(notifier, monkeypatch)
-
-    notifier.send_job(make_posting(), score=None, deep=None, language_unverified=True)
-
-    text = captured["json"]["text"]
-    assert "language not verified" in text
-    assert "⚠️" in text
-
-
-def test_send_job_without_language_unverified_omits_warning(notifier, monkeypatch):
-    captured = capture(notifier, monkeypatch)
-    notifier.send_job(make_posting(), deep=make_deep())
-    assert "language not verified" not in captured["json"]["text"]
-
-
 def test_send_job_without_deep_result_makes_no_coverage_claim(notifier, monkeypatch):
     """Fail-open paths let a job through unevaluated -- the message must not
     imply a match percentage it doesn't have."""
@@ -217,7 +198,7 @@ def test_send_job_shows_the_interview_chance_as_an_estimate(notifier, monkeypatc
 def test_send_job_labels_a_fail_open_alert(notifier, monkeypatch):
     """Without this an API outage looks like a flood of bad matches."""
     captured = capture(notifier, monkeypatch)
-    notifier.send_job(make_posting(), unfiltered_reason="title scoring failed (HTTP 401)")
+    notifier.send_job(make_posting(), warnings=("Not filtered — title scoring failed (HTTP 401)",))
 
     assert "Not filtered" in captured["json"]["text"]
     assert "HTTP 401" in captured["json"]["text"]

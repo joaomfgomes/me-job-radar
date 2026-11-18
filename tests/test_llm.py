@@ -19,7 +19,12 @@ def client():
     client.close()
 
 
+USAGE = SimpleNamespace(input_tokens=100, cache_read_input_tokens=900, cache_creation_input_tokens=0,
+                        output_tokens=50)
+
+
 def stub(client, monkeypatch, response):
+    response.usage = USAGE
     calls = []
 
     def fake_parse(**kwargs):
@@ -63,3 +68,12 @@ def test_from_env_requires_the_key(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
         ClaudeClient.from_env()
+
+
+def test_parse_logs_token_usage_including_the_cached_share(client, monkeypatch, caplog):
+    stub(client, monkeypatch, SimpleNamespace(stop_reason="end_turn", parsed_output=Answer(value=1)))
+
+    with caplog.at_level("INFO", logger="jobradar.llm"):
+        client.parse(model="claude-haiku-5-5", system="s", user="u", schema=Answer)
+
+    assert "1000 input tokens (900 read from cache, 0 written to cache), 50 output" in caplog.text

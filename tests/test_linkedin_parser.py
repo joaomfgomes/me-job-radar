@@ -8,7 +8,10 @@ fixture, that's the signal to fix the parser.
 
 from pathlib import Path
 
+import pytest
+
 from jobradar.models import JobPosting, SearchConfig
+from jobradar.sources.base import RateLimitedError
 from jobradar.sources.linkedin import LinkedInGuestSource
 
 FIXTURE = Path(__file__).parent / "fixtures" / "search_response.html"
@@ -109,3 +112,36 @@ def test_fetch_dedupes_a_job_repeated_across_pages():
     result = src.fetch(SearchConfig(name="s", keywords="k", location="l"))
     assert len(result) == 19
     assert len({p.job_id for p in result}) == 19
+
+
+# --- rate limiting ---------------------------------------------------------
+
+class _Response:
+    def __init__(self, status_code, text=""):
+        self.status_code, self.text = status_code, text
+
+    def raise_for_status(self):
+        pass
+
+
+def _source_answering(monkeypatch, statuses):
+    """A real source whose HTTP client answers with the given status codes
+    in order, and whose waits are instant."""
+    source = LinkedInGuestSource()
+    answers = iter(statuses)
+    monkeypatch.setattr(source._client, "get", lambda *a, **kw: _Response(next(answers)))
+    monkeypatch.setattr("jobradar.sources.linkedin.time.sleep", lambda seconds: None)
+    return source
+
+
+def test_a_rate_limited_request_is_retried_once(monkeypatch):
+    source = _source_answering(monkeypatch, [429, 200])
+    assert source.fetch(SearchConfig(name="s", keywords="k", location="l")) == []
+    source.close()
+
+
+def test_a_second_rate_limit_is_reported_not_swallowed(monkeypatch):
+    source = _source_answering(monkeypatch, [429, 999])
+    with pytest.raises(RateLimitedError):
+        source.fetch(SearchConfig(name="s", keywords="k", location="l"))
+    source.close()

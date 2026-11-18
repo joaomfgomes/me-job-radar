@@ -8,8 +8,11 @@ Two properties matter throughout and are asserted repeatedly:
     whatever score was obtained before the failure.
 """
 
+import dataclasses
+
 import pytest
 
+from jobradar.evaluation import Evaluator
 from jobradar.models import JobPosting
 from jobradar.pipeline import Pipeline
 from jobradar.profile import Dealbreakers, Profile
@@ -28,12 +31,17 @@ def store(tmp_path):
 def run(store, settings, profile, posting, scorer=None, jd_fetcher=None):
     store.mark_seeded(settings.searches[0].name)  # skip first-run seeding
     notifier = FakeNotifier()
-    pipeline = Pipeline(
-        settings, store, {"linkedin": FakeSource([posting])}, notifier,
-        profile=profile, scorer=scorer, jd_fetcher=jd_fetcher,
-    )
+    pipeline = Pipeline(settings, store, {"linkedin": FakeSource([posting])}, notifier,
+                        make_evaluator(settings, profile, scorer, jd_fetcher))
     pipeline.run_cycle()
     return notifier, pipeline
+
+
+def make_evaluator(settings, profile, scorer=None, jd_fetcher=None):
+    return Evaluator(profile, scorer, jd_fetcher,
+                     deep_score_threshold=settings.deep_score_threshold,
+                     min_coverage_pct=settings.min_coverage_pct,
+                     years_stretch=settings.years_stretch)
 
 
 def row(store, columns, job_id="linkedin:1"):
@@ -47,11 +55,11 @@ def test_coverage_at_or_above_threshold_alerts(store, settings, profile, posting
     notifier, _ = run(store, settings, profile, posting, scorer, FakeJDFetcher("Full JD."))
 
     assert notifier.sent_postings == [posting]
-    _, score, deep, language_unverified = notifier.sent[0]
+    _, score, deep, warnings = notifier.sent[0]
     assert deep.coverage_pct == 80
     assert score == 9  # Decision.score prefers the deep pass
-    assert language_unverified is False  # JD was available -- language WAS checked
-    assert row(store, "notified, coverage_pct, is_junior_appropriate") == (1, 80, 1)
+    assert warnings == ()  # a fully evaluated alert carries no warning
+    assert row(store, "notified, coverage_pct, outcome") == (1, 80, "alerted")
 
 
 def test_coverage_below_threshold_is_held_back(store, settings, profile, posting):
@@ -73,17 +81,34 @@ def test_senior_role_is_held_back_even_at_full_coverage(store, settings, profile
     assert "not junior-appropriate" in row(store, "score_reason")[0]
 
 
-def test_jd_stated_years_above_ceiling_rejects_even_at_full_coverage(store, settings, profile, posting):
-    """profile.max_years_experience=3 (see conftest) -- a JD stating 4+
-    years must hard-reject regardless of how well the CV otherwise matches,
-    exactly like the deterministic Wellfound-metadata check, but for a
-    number the model extracted from free text instead of structured data."""
-    scorer = FakeScorer(ScoreResult(9, "Relevant."), make_deep(met=10, unmet=0, years_required=4))
+def test_jd_stated_years_beyond_the_stretch_rejects_even_at_full_coverage(store, settings, profile, posting):
+    """Ceiling 3 (see conftest) plus a 1-year stretch: 5+ years is out,
+    however well the CV otherwise matches -- a number the model extracted,
+    compared in Python."""
+    scorer = FakeScorer(ScoreResult(9, "Relevant."), make_deep(met=10, unmet=0, years_required=5))
     notifier, _ = run(store, settings, profile, posting, scorer, FakeJDFetcher("Full JD."))
 
     assert notifier.sent == []
-    assert "4+ years" in row(store, "score_reason")[0]
-    assert "3-year ceiling" in row(store, "score_reason")[0]
+    assert row(store, "outcome, score_reason") == ("years", "posting requires 5+ years, above the 3-year ceiling")
+
+
+def test_jd_stated_years_within_the_stretch_alert_with_a_warning(store, settings, profile, posting):
+    """"4+ years" against a 3-year ceiling is a stretch worth applying to,
+    so it goes out -- saying so."""
+    scorer = FakeScorer(ScoreResult(9, "Relevant."), make_deep(met=10, unmet=0, years_required=4))
+    notifier, _ = run(store, settings, profile, posting, scorer, FakeJDFetcher("Full JD."))
+
+    _, _, _, warnings = notifier.sent[0]
+    assert warnings == ("Asks for 4+ years of experience (your ceiling is 3) — a stretch, still worth a try",)
+    assert row(store, "outcome") == ("alerted",)
+
+
+def test_no_stretch_means_the_ceiling_is_strict(store, settings, profile, posting):
+    strict = dataclasses.replace(settings, years_stretch=0)
+    scorer = FakeScorer(ScoreResult(9, "Relevant."), make_deep(met=10, unmet=0, years_required=4))
+    notifier, _ = run(store, strict, profile, posting, scorer, FakeJDFetcher("Full JD."))
+
+    assert notifier.sent == []
 
 
 def test_jd_stated_years_at_or_below_ceiling_does_not_reject(store, settings, profile, posting):
@@ -170,8 +195,8 @@ def test_jd_fetch_failure_alerts_unfiltered(store, settings, profile, posting):
 
     assert notifier.sent_postings == [posting]
     assert "description unavailable" in row(store, "score_reason")[0]
-    _, _, _, language_unverified = notifier.sent[0]
-    assert language_unverified is True
+    _, _, _, warnings = notifier.sent[0]
+    assert "Not filtered — description unavailable" in warnings[0]
 
 
 def test_title_scoring_failure_alerts_unfiltered(store, settings, profile, posting):
@@ -216,8 +241,8 @@ def test_no_description_available_alerts_on_the_title_score_alone(store, setting
 
     assert notifier.sent_postings == [posting]
     assert scorer.deep_calls == []
-    _, _, _, language_unverified = notifier.sent[0]
-    assert language_unverified is True
+    _, _, _, warnings = notifier.sent[0]
+    assert "Not filtered — description unavailable" in warnings[0]
     assert row(store, "outcome") == ("alerted_unfiltered",)
 
 
@@ -278,7 +303,7 @@ def test_fail_open_alert_carries_the_reason_to_the_notifier(store, settings, pro
     scorer = FakeScorer(ScoreResult(None, "scoring unavailable: HTTP 401", unscored=True))
     notifier, _ = run(store, settings, profile, posting, scorer, FakeJDFetcher("Full JD."))
 
-    assert "title scoring failed" in notifier.unfiltered_reasons[0]
+    assert "Not filtered — title scoring failed" in notifier.sent[0][3][0]
 
 
 # --- source-provided descriptions ---------------------------------------
@@ -303,6 +328,61 @@ def test_notify_failure_leaves_job_unseen_for_retry(store, settings, profile, po
     notifier = FakeNotifier()
     notifier.send_job = lambda posting, **kwargs: None
     Pipeline(settings, store, {"linkedin": FakeSource([posting])}, notifier,
-             profile=None, scorer=None).run_cycle()
+             make_evaluator(settings, profile=None)).run_cycle()
 
     assert row(store, "job_id") is None  # not marked seen -> retried next cycle
+
+
+# --- reposts --------------------------------------------------------------
+
+def repost_of(posting, job_id="2", title=None):
+    return dataclasses.replace(posting, job_id=job_id, title=title or posting.title)
+
+
+def run_both(store, settings, profile, first, second, scorer):
+    """Evaluates `first`, then `second` in a later cycle."""
+    store.mark_seeded(settings.searches[0].name)
+    notifier = FakeNotifier()
+    source = FakeSource([first])
+    pipeline = Pipeline(settings, store, {"linkedin": source}, notifier,
+                        make_evaluator(settings, profile, scorer, FakeJDFetcher("Full JD.")))
+    pipeline.run_cycle()
+    source._postings = [second]
+    pipeline.run_cycle()
+    return notifier
+
+
+def test_a_repost_inherits_the_earlier_rejection_without_a_new_evaluation(store, settings, profile, posting):
+    scorer = FakeScorer(ScoreResult(9, "Relevant."), make_deep(met=2, unmet=8))
+    notifier = run_both(store, settings, profile, posting, repost_of(posting, title="AI ENGINEER (m/f/d)"), scorer)
+
+    assert notifier.sent == []
+    assert len(scorer.deep_calls) == 1  # the repost cost nothing
+    outcome, reason = row(store, "outcome, score_reason", job_id="linkedin:2")
+    assert outcome == "repost" and "low_coverage" in reason
+
+
+def test_a_repost_of_an_alerted_job_is_not_alerted_again(store, settings, profile, posting):
+    scorer = FakeScorer(ScoreResult(9, "Relevant."), make_deep(met=9, unmet=1))
+    notifier = run_both(store, settings, profile, posting, repost_of(posting), scorer)
+
+    assert notifier.sent_postings == [posting]
+    assert "(alerted)" in row(store, "score_reason", job_id="linkedin:2")[0]
+
+
+def test_a_repost_of_an_unfiltered_job_gets_a_real_evaluation(store, settings, profile, posting):
+    """The first copy went out unfiltered (the model was down), so it was
+    never really judged -- the repost is its second chance."""
+    scorer = FakeScorer(ScoreResult(None, "scoring unavailable", unscored=True))
+    notifier = run_both(store, settings, profile, posting, repost_of(posting), scorer)
+
+    assert len(scorer.score_calls) == 2
+    assert len(notifier.sent) == 2
+
+
+def test_the_same_title_at_another_company_is_not_a_repost(store, settings, profile, posting):
+    scorer = FakeScorer(ScoreResult(9, "Relevant."), make_deep(met=9, unmet=1))
+    other = dataclasses.replace(posting, job_id="2", company="Other Co")
+    notifier = run_both(store, settings, profile, posting, other, scorer)
+
+    assert notifier.sent_postings == [posting, other]

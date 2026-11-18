@@ -8,7 +8,7 @@ it to the next one:
   1  prefilter          free                  title/employer dealbreakers,
                                               seniority words in the title
   2  stated years       free                  boards that state an experience
-                                              floor above the ceiling
+                                              floor well above the ceiling
   3  title score        1 small LLM call      roles that are plainly off-target
   4  description        1 request (LinkedIn)  nothing -- see "fail open"
   5  language           free                  descriptions the candidate
@@ -20,6 +20,12 @@ it to the next one:
 The title score runs before the description is fetched on purpose: it is
 what keeps the number of LinkedIn requests low. Only postings whose title
 looks relevant cost a description fetch.
+
+YEARS ARE A SOFT LIMIT. A posting may ask for up to `years_stretch` more
+years than the candidate's ceiling and still be alerted, with a warning
+line. Stated years are a weak signal for entry-level hiring: in this app's
+own data, "4+ years" against a 3-year ceiling was the single most common
+reason a well-matched posting was rejected.
 
 FAIL OPEN. Every stage that depends on something outside this process (the
 description fetch, either LLM call) answers "alert it" when that thing
@@ -51,8 +57,9 @@ class Outcome(StrEnum):
 
     ALERTED = "alerted"                # passed every gate
     UNFILTERED = "alerted_unfiltered"  # a fail-open path: sent without a full evaluation
+    REPOST = "repost"                  # same company and title as a job already evaluated (see pipeline.py)
     PREFILTER = "prefilter"
-    YEARS = "years"                    # asks for more experience than the ceiling
+    YEARS = "years"                    # asks for more experience than ceiling + stretch
     TITLE_LOW = "title_low"
     LANGUAGE = "language"
     NOT_JUNIOR = "not_junior"
@@ -70,9 +77,9 @@ class Decision:
     deep: DeepScoreResult | None = None
     title_score: int | None = None
     title_score_reason: str | None = None
-    # True when no description was ever available, so the language check
-    # never ran. The alert warns about it explicitly.
-    language_unverified: bool = False
+    # Shown in the alert when a job is sent despite a known weakness (it
+    # asks for a little more experience than the candidate has).
+    warnings: tuple[str, ...] = ()
 
     @property
     def notify(self) -> bool:
@@ -88,27 +95,25 @@ class Decision:
         return self.title_score
 
 
-@dataclass(frozen=True)
-class Thresholds:
-    """The tunable bars, lifted out of Settings so the evaluator depends on
-    three numbers rather than on the whole configuration."""
-
-    deep_score_threshold: int
-    min_coverage_pct: int
-
-
 class Evaluator:
     def __init__(
         self,
         profile: Profile | None,
         scorer: JobScorer | None,
         jd_fetcher: JobDescriptionFetcher | None,
-        thresholds: Thresholds,
+        *,
+        deep_score_threshold: int,
+        min_coverage_pct: int,
+        years_stretch: int = 0,
     ) -> None:
+        """Takes the bars it applies rather than the whole Settings, so its
+        dependencies are visible in its signature."""
         self._profile = profile
         self._scorer = scorer
         self._jd_fetcher = jd_fetcher
-        self._thresholds = thresholds
+        self._deep_score_threshold = deep_score_threshold
+        self._min_coverage_pct = min_coverage_pct
+        self._years_stretch = years_stretch
 
     def evaluate(self, posting: JobPosting) -> Decision:
         profile = self._profile
@@ -121,10 +126,9 @@ class Evaluator:
         if not pre.passed:
             return Decision(Outcome.PREFILTER, f"prefilter: {pre.reason}")
 
-        ceiling = profile.max_years_experience
-        stated = posting.years_experience_min
-        if ceiling is not None and stated is not None and stated > ceiling:
-            return Decision(Outcome.YEARS, f"posting requires {stated}+ years, above the {ceiling}-year ceiling")
+        too_many_years = self._years_rejection(posting.years_experience_min)
+        if too_many_years:
+            return Decision(Outcome.YEARS, too_many_years)
 
         if self._scorer is None:
             return Decision(Outcome.UNFILTERED, "scoring disabled -- prefilter only")
@@ -138,7 +142,7 @@ class Evaluator:
                 title_score_reason=title.reason,
             )
         scores = {"title_score": title.score, "title_score_reason": title.reason}
-        if title.score < self._thresholds.deep_score_threshold:
+        if title.score < self._deep_score_threshold:
             return Decision(Outcome.TITLE_LOW, f"title score {title.score}/10: {title.reason}", **scores)
 
         # 4: description -- free when the board already supplied it.
@@ -147,8 +151,7 @@ class Evaluator:
             jd_text = self._jd_fetcher.fetch(posting.job_id)
         if jd_text is None:
             return Decision(
-                Outcome.UNFILTERED, "description unavailable -- title score only",
-                language_unverified=True, **scores,
+                Outcome.UNFILTERED, "description unavailable -- language and requirements not checked", **scores
             )
 
         # 5: language.
@@ -165,20 +168,31 @@ class Evaluator:
         )
         return self._judge(deep, scores)
 
+    def _years_rejection(self, required: int | None) -> str | None:
+        """Why the posting asks for too much experience, or None if it does
+        not. Up to `years_stretch` years over the ceiling is allowed."""
+        ceiling = self._profile.max_years_experience
+        if required is None or ceiling is None or required <= ceiling + self._years_stretch:
+            return None
+        return f"posting requires {required}+ years, above the {ceiling}-year ceiling"
+
+    def _years_warning(self, required: int | None) -> tuple[str, ...]:
+        ceiling = self._profile.max_years_experience
+        if required is None or ceiling is None or required <= ceiling:
+            return ()
+        return (f"Asks for {required}+ years of experience (your ceiling is {ceiling}) — a stretch, still worth a try",)
+
     def _judge(self, deep: DeepScoreResult, scores: dict) -> Decision:
         """Applies the gates to a deep result, strictest signal first."""
         if deep.unscored:
             return Decision(Outcome.UNFILTERED, f"deep scoring failed ({deep.reason})", deep=deep, **scores)
 
-        # An extracted number, compared in Python: "4+ years" means 4+ years,
-        # whatever the model thinks of the candidate otherwise.
-        ceiling = self._profile.max_years_experience
-        if deep.years_required is not None and ceiling is not None and deep.years_required > ceiling:
-            return Decision(
-                Outcome.YEARS,
-                f"posting requires {deep.years_required}+ years, above the {ceiling}-year ceiling",
-                deep=deep, **scores,
-            )
+        # An extracted number, compared in Python rather than left to the
+        # model's judgment.
+        too_many_years = self._years_rejection(deep.years_required)
+        if too_many_years:
+            return Decision(Outcome.YEARS, too_many_years, deep=deep, **scores)
+        scores = {**scores, "warnings": self._years_warning(deep.years_required)}
 
         # The model's holistic read, for postings that are senior without
         # stating a number.
@@ -195,7 +209,7 @@ class Evaluator:
             # a modelling artefact, so fail open.
             return Decision(Outcome.UNFILTERED, "no requirements extracted", deep=deep, **scores)
 
-        bar = self._thresholds.min_coverage_pct
+        bar = self._min_coverage_pct
         if coverage < bar:
             return Decision(Outcome.LOW_COVERAGE, f"{coverage}% requirement coverage, below {bar}%", deep=deep, **scores)
         return Decision(Outcome.ALERTED, f"{coverage}% requirement coverage", deep=deep, **scores)

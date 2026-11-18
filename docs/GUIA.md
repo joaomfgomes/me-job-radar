@@ -27,14 +27,17 @@ config.yaml ──► pipeline.py ──► sources/*.py ──► store.py (já
 
 1. **`main.py`** arranca tudo: lê a configuração, cria os objetos e agenda
    dois trabalhos (o ciclo de pesquisa e o resumo diário). Depois fica a
-   ouvir comandos do Telegram na thread principal.
+   ouvir comandos do Telegram na thread principal. É o único sítio que sabe
+   como as peças encaixam; todos os outros módulos recebem aquilo de que
+   precisam como argumento, e é isso que permite testá-los com objetos
+   falsos.
 2. **`pipeline.py`** corre um ciclo. Para cada pesquisa ativa pede as vagas
    à fonte, pergunta à base de dados quais são novas e entrega cada uma ao
    avaliador. Só marca uma vaga como vista depois de o alerta ser entregue.
 3. **`evaluation.py`** é onde se decide. É o ficheiro mais importante para
    perceber o comportamento do programa.
 4. **`notify.py`** formata e envia a mensagem; **`store.py`** guarda o
-   resultado.
+   veredicto numa única escrita (`record_verdict`).
 
 ## A cascata de avaliação
 
@@ -45,14 +48,32 @@ só no fim o pedido ao LinkedIn e a leitura completa.
 | # | Etapa | Custo | O que rejeita | Código do resultado |
 |---|---|---|---|---|
 | 1 | Pré-filtro | grátis | Palavras proibidas no título ou na empresa, "Senior"/"Lead" no título | `prefilter` |
-| 2 | Anos declarados | grátis | Fontes que indicam mais anos do que o teu limite | `years` |
+| 2 | Anos declarados | grátis | Fontes que indicam mais anos do que o teu limite + `years_stretch` | `years` |
 | 3 | Nota do título | 1 chamada pequena | Funções claramente fora do alvo | `title_low` |
 | 4 | Descrição | 1 pedido ao LinkedIn | Nada (se falhar, alerta na mesma) | — |
 | 5 | Língua | grátis | Descrições numa língua que não lês | `language` |
-| 6 | Leitura completa | 1 chamada | Anos a mais, demasiado sénior, localização, cobertura baixa | `years`, `not_junior`, `location`, `low_coverage` |
+| 6 | Leitura completa | 1 chamada | Anos a mais, demasiado sénior, localização, cobertura abaixo de 60% | `years`, `not_junior`, `location`, `low_coverage` |
 
 Uma vaga que passa tudo fica com `alerted`. O código do resultado é o que o
 comando `/stats` conta.
+
+### Três regras para não perder vagas
+
+- **Cobertura mínima de 60%.** Estudos de recrutamento indicam que quem
+  cumpre metade a 60% dos requisitos é chamado a entrevista quase tantas
+  vezes como quem cumpre quase todos. Nos dados do Porto, a faixa 60–79%
+  tinha tantas vagas boas como a de cima. Entre 50% e 59% vai para o resumo
+  diário.
+- **Anos com margem.** Uma vaga pode pedir até `years_stretch` (1) anos a
+  mais do que o teu `max_years_experience` e ser enviada, com um aviso
+  "⚠️ Asks for 4+ years…". Só acima disso é rejeitada.
+- **Vagas republicadas avaliadas uma vez.** Os recrutadores voltam a
+  publicar a mesma vaga com outro id de poucos em poucos dias. Uma vaga com
+  a mesma empresa e o mesmo título (ignorando maiúsculas e marcas como
+  "(m/f/d)") de outra avaliada nos últimos 30 dias herda esse veredicto, com
+  o resultado `repost`, e nunca é enviada duas vezes. Antes, a mesma vaga
+  podia dar 33% num dia e 83% no outro. A exceção são as vagas enviadas sem
+  filtro por falha da API: essas são avaliadas a sério quando reaparecem.
 
 ### "Fail open"
 
@@ -122,7 +143,6 @@ factos.
 | `job_insights` | Uma linha por vaga lida por completo: função, senioridade, regime, salário |
 | `job_skills` | Uma linha por competência pedida numa vaga, e se o teu CV a tem |
 | `seeded_searches` | Pesquisas que já fizeram a primeira execução silenciosa |
-| `location_prefs`, `custom_locations` | Localizações ligadas, desligadas ou acrescentadas pelo Telegram |
 
 A primeira vez que uma pesquisa corre, as vagas existentes são registadas
 sem alertar. É isso que impede uma avalanche de mensagens ao adicionar uma
@@ -141,20 +161,33 @@ Como só são lidas por completo as vagas cujo título parece relevante, o
 significa "está escrito no perfil ou no CV": uma competência que dominas
 mas nunca escreveste aparece como lacuna até a acrescentares.
 
-## Porto e remoto
+## Pesquisas e localização
 
-A pesquisa do LinkedIn sem login ignora o filtro de trabalho remoto (foi
-testado: devolve as mesmas vagas com e sem o filtro). Por isso não é
-possível pedir "só remotas". O que o `config.yaml` faz é pesquisar largo
-(Porto, Portugal inteiro e União Europeia) e deixar a leitura completa
-rejeitar o que não serve, com base em `location_preferences`. As rejeitadas
-aparecem em `/stats` como "Location does not fit".
+O `config.yaml` tem duas listas: `locations` (onde procurar) e `sources`
+(as palavras-chave de cada site). Cada palavra-chave é pesquisada em cada
+localização; hoje isso dá onze pesquisas no LinkedIn, todas no Porto, em
+todos os ciclos. Além dos títulos de IA, há termos mais largos ("Data
+Scientist", "Python", "NLP", "Inteligência Artificial") que trazem vagas
+que os títulos de IA não apanham; a nota do título descarta o ruído por
+uma fração de cêntimo. O Wellfound está desligado (zero vagas no Porto),
+mas o código continua disponível: basta voltar a pô-lo no `config.yaml`.
+Os sites conhecidos estão registados em `sources/__init__.py`.
+
+A pesquisa do LinkedIn sem login ignora os filtros de senioridade e de
+trabalho remoto (foi testado: devolve as mesmas vagas com e sem eles). Por
+isso essas duas decisões são tomadas a partir da própria vaga: o pré-filtro
+trata das palavras no título e a leitura completa compara a descrição com
+`location_preferences`.
+
+Os pedidos ao LinkedIn são espaçados 2,5 segundos e, se a resposta for um
+bloqueio (HTTP 429), há uma segunda tentativa após uma pausa. Uma pesquisa
+que falhe três ciclos seguidos gera um aviso no Telegram.
 
 ## Onde mexer para…
 
 | Quero… | Ficheiro |
 |---|---|
-| Mudar as pesquisas ou as localizações | `config.yaml` |
+| Mudar as palavras-chave ou acrescentar uma cidade | `config.yaml` |
 | Mudar o que aceito (anos, línguas, localização, exclusões) | `profile.yaml` |
 | Ser mais ou menos exigente | `min_coverage_pct` e `deep_score_threshold` em `config.yaml` |
 | Usar um modelo mais forte na leitura completa | `deep_model` em `config.yaml` |
@@ -172,4 +205,7 @@ uv run --extra dev pytest
 
 Correm sem rede: o LinkedIn, o Telegram e o Claude são substituídos por
 objetos falsos (`tests/conftest.py`). Os testes de `test_pipeline_evaluation.py`
-são a melhor documentação do comportamento esperado da cascata.
+são a melhor documentação do comportamento esperado da cascata, e os de
+`test_pipeline.py` do ciclo (primeira execução silenciosa, avisos de falha,
+resumo diário). O GitHub Actions corre os mesmos testes, o lint e uma
+auditoria de dependências em cada pull request.

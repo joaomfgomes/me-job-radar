@@ -1,85 +1,57 @@
-# Copy to config.yaml and edit. config.yaml is gitignored -- keep your real
-# searches private if you want (they can reveal what roles/comp you target).
+# Copy to config.yaml and edit. config.yaml is gitignored: your searches can
+# reveal which roles you are targeting.
 
-# Searches are generated from a matrix: keywords x locations, per board.
-# Adding a country is one entry under `locations` -- no per-keyword blocks
-# to hand-write. `searches`/`secondary_searches` below still work too, for
-# one-off searches that don't fit the grid.
-search_matrix:
-  locations:
-    # Each source key is that board's own query format: LinkedIn takes
-    # free-text ("Netherlands", "Berlin, Germany"), Wellfound takes a URL
-    # slug from its own location vocabulary ("netherlands", "berlin"). A
-    # location that omits a source's key just isn't searched on that board.
-    #
-    # LinkedIn's guest endpoint caps results at 10 per request regardless of
-    # search volume, and each (keywords, location) pair gets its own 10-slot
-    # budget -- so a busy country is worth splitting into hub cities rather
-    # than searched as one entry, the way Madrid/Barcelona are below.
-    - name: "Lisbon"
-      linkedin: "Lisbon, Portugal"
-      wellfound: "lisbon"
-    - name: "Amsterdam"
-      linkedin: "Amsterdam, Netherlands"
-      wellfound: "amsterdam"
-    # time_posted_seconds/workplace_type/max_pages can be set per-location
-    # too, overriding the source's own defaults/secondary_defaults below.
+# Every keyword of every board is searched in every location that board
+# covers. A location gives its query per board, in that board's own format:
+# free text on LinkedIn, a URL slug on Wellfound. Leave a board's key out to
+# skip that board for that location.
+locations:
+  - name: "Porto"
+    linkedin: "Porto, Portugal"
+    wellfound: "porto"
 
-  sources:
-    linkedin:
-      core_keywords: ["AI Engineer"]
-      secondary_keywords: ["LLM Engineer"]
-      defaults:
-        time_posted_seconds: 1800     # core runs every cycle -- 30min matches a 10min poll interval
-      secondary_defaults:
-        # Secondary searches rotate secondary_batch_size at a time instead of
-        # running every cycle -- see pipeline below. This window must be wide
-        # enough to cover a full rotation (pool_size / secondary_batch_size
-        # cycles) or postings between a search's visits go unseen. With, say,
-        # 10 secondary searches at 2/cycle and a 10min interval, a full
-        # rotation is 50min -- 7200s (2h) below leaves comfortable margin.
-        time_posted_seconds: 7200
+sources:
+  linkedin:
+    keywords:
+      - "AI Engineer"
+      - "LLM Engineer"
+    # How far back each search looks. It must comfortably exceed
+    # poll_interval_minutes, or a posting published between two polls is
+    # never seen; anything already seen is ignored, so a wide window is safe.
+    time_posted_seconds: 3600
+    max_pages: 3                  # 10 results per page
 
-    wellfound:
-      # Wellfound role slugs (its own vocabulary, not free text) -- see
-      # https://wellfound.com/role/l/<role-slug>/<location-slug> in a browser
-      # to find one for a role you care about.
-      secondary_keywords: ["ai-engineer"]
-      defaults:
-        # Wellfound postings stay live for weeks, not minutes -- a narrow
-        # window would return nothing. Dedup makes a wide one safe: each job
-        # still only alerts once no matter how many times its window is polled.
-        time_posted_seconds: 259200   # 3 days
+  wellfound:
+    # Role slugs from Wellfound's own vocabulary, not free text: the <role>
+    # part of https://wellfound.com/role/l/<role>/<location>.
+    keywords:
+      - "artificial-intelligence-engineer"
+    # Wellfound keeps postings up for weeks, so a narrow window finds nothing.
+    time_posted_seconds: 259200   # 3 days
 
-searches:
-  - name: "Backend Python - Remote EU"
-    keywords: "Python Backend Engineer"
-    location: "European Union"
-    time_posted_seconds: 1800
-    # workplace_type ("1" on-site, "2" remote, "3" hybrid) is passed to
-    # LinkedIn but its guest search appears to ignore it. To target remote
-    # roles, describe what you accept in profile.yaml's location_preferences.
-
-secondary_searches: []
-
+# Everything below is optional; these are the defaults.
 pipeline:
   poll_interval_minutes: 10
-  poll_jitter_seconds: 60        # random +/- jitter so requests aren't clockwork-regular
+  poll_jitter_seconds: 60                 # random offset so polls are not clockwork-regular
   db_path: "state.db"
   log_path: "jobradar.log"
-  consecutive_error_alert_threshold: 3    # alert after N back-to-back fetch failures (rate limit etc.)
-  consecutive_empty_alert_threshold: 24   # alert after N back-to-back zero-result cycles (~4h @ 10min) -- likely a broken parser
-  profile_path: "profile.yaml"            # optional: enables scoring if this file exists and ANTHROPIC_API_KEY is set (see profile.example.yaml)
-  secondary_batch_size: 2                 # how many secondary searches to poll per cycle (rotates through the rest)
+  profile_path: "profile.yaml"            # without this file nothing is filtered
 
-  # A job is only alerted once its full description has been read AND at
-  # least min_coverage_pct of its must-have requirements are covered by the
-  # CV/profile, AND it is junior-appropriate, AND its location fits. Coverage is computed from the requirement list the
-  # model returns, not asked of it directly -- see scoring.py.
-  deep_score_threshold: 4                 # title-only score >= this triggers the deep (JD-based) pass
-  min_coverage_pct: 80                    # alert bar
-  digest_min_coverage_pct: 60             # near-misses [this, min_coverage_pct) go in the daily digest instead of silence
-  digest_hour: 9                          # local hour the daily digest sends
-  title_model: "claude-haiku-5-5"         # first pass, title only -- runs on every job that clears the prefilter
-  deep_model: "claude-haiku-5-5"          # full-description pass -- only jobs that clear deep_score_threshold.
-                                          # Set to "claude-sonnet-5-5" for a stronger (costlier) judgment.
+  # Health warnings sent to Telegram.
+  consecutive_error_alert_threshold: 3    # failed fetches in a row for one search
+  consecutive_empty_alert_threshold: 24   # empty results in a row (~4h): the parser may be broken
+
+  # What gets alerted. A job must look relevant by title, then cover enough
+  # of the posting's must-have requirements (computed from the list the
+  # model returns, see scoring.py), be junior-appropriate, and fit
+  # profile.yaml's location_preferences.
+  deep_score_threshold: 4                 # title score (1-10) needed to read the full description
+  min_coverage_pct: 60                    # requirement coverage needed to alert
+  digest_min_coverage_pct: 50             # near misses from here up are summarised once a day
+  years_stretch: 1                        # years above max_years_experience still alerted, with a warning
+  digest_hour: 9                          # local hour of that daily summary
+
+  # Claude model for each pass. Set deep_model to "claude-sonnet-5-5" for a
+  # stronger (and costlier) judgment on the full-description pass only.
+  title_model: "claude-haiku-5-5"
+  deep_model: "claude-haiku-5-5"

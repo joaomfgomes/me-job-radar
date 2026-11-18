@@ -91,7 +91,7 @@ def test_candidate_context_carries_profile_and_location_preferences():
     assert "Data Engineer" in context  # adjacent-role note
     assert "Prefer product companies over consultancies." in context
     assert "remote from Portugal" in context
-    assert "Maximum years of experience the candidate has: 3" in context
+    assert "Years of professional experience: about 3 at most" in context
 
 
 def test_candidate_context_includes_cv_when_given():
@@ -193,3 +193,13 @@ def test_coverage_pct_rounds_from_the_requirement_list():
 
 def test_coverage_pct_is_none_when_no_requirements_were_extracted():
     assert DeepScoreResult(score=8, reason="").coverage_pct is None
+
+
+def test_the_prompt_leaves_stated_years_to_the_code():
+    """The years gate is a soft limit applied in Python (evaluation.py). If
+    the prompt also told the model to reject over-ceiling postings, every
+    "4+ years" job would be caught as not junior-appropriate instead."""
+    from jobradar.scoring import DEEP_INSTRUCTIONS
+
+    assert "checked separately" in candidate_context(make_profile())
+    assert "set it false only because of a stated number of years" in DEEP_INSTRUCTIONS
