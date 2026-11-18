@@ -25,10 +25,8 @@ seniority: entry-to-mid  # options: intern, entry, mid, senior, staff+ -- used a
 # call needed. Remove or leave blank to rely on the scorer alone.
 max_years_experience: 3
 
-# Enforced two ways (step 5 filter tuning): passed to the LLM scorer as
-# context, and -- when a JD fetcher is configured -- checked deterministically
-# against the full job description before a job is ever notified (see
-# lang_filter.py). List names, not ISO codes; unrecognized names are ignored.
+# Languages you can work in. A posting whose description is written in any
+# other language is held back (see lang_filter.py). Use names, not ISO codes.
 languages:
   - English
   # - Portuguese
@@ -52,7 +50,7 @@ adjacent_roles_require_llm_tie:
   - "MLOps Engineer"
   - "ML Infrastructure Engineer"
 
-# Hard rules -- enforced by the deterministic pre-filter (step 3), before
+# Hard rules -- enforced by the deterministic pre-filter, before
 # any LLM call. A job matching one of these is dropped/never scored.
 dealbreakers:
   title_contains:

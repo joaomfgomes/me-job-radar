@@ -76,10 +76,10 @@ it; give no credit for adjacent or assumed knowledge. In `evidence`, cite what \
 demonstrates it, or state plainly what is missing.
 - years_required: the MINIMUM years of professional experience the posting states \
 ("4+ years", "3-5 years" -> 4, 3). Copy the number as stated; null if none is given.
-- is_junior_appropriate: false if the posting needs more experience than the \
-candidate's ceiling, OR the role centres on leading a team, owning architecture, or \
-being the most senior expert -- even when the title does not say "Senior". When \
-genuinely ambiguous, answer false.
+- is_junior_appropriate: false if the role centres on leading a team, owning architecture, or \
+being the most senior expert -- even when the title does not say "Senior". Do not \
+set it false only because of a stated number of years: that is compared with the \
+candidate's experience separately. When genuinely ambiguous, answer false.
 - location_fit: whether the candidate could take this job given their location \
 preferences below. False when the role must be done on-site or hybrid somewhere the \
 candidate does not accept, or is remote but restricted to countries that exclude the \
@@ -239,8 +239,8 @@ def candidate_context(profile: Profile, cv_context: str | None = None) -> str:
     ]
     if profile.max_years_experience is not None:
         lines.append(
-            f"Maximum years of experience the candidate has: {profile.max_years_experience}. "
-            "A posting requiring more than this is above the ceiling -- not a judgment call."
+            f"Years of professional experience: about {profile.max_years_experience} at most. "
+            "Stated years requirements are checked separately; judge the role, not the number."
         )
     if profile.languages:
         lines.append(f"Languages the candidate works in: {', '.join(profile.languages)}")

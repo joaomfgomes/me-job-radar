@@ -1,107 +1,88 @@
-"""Offline tests for the keywords x locations search matrix (config.py's
-_expand_matrix). No file I/O -- load_settings() itself is covered
-indirectly since it's exercised end-to-end via config.yaml already.
-"""
+"""config.yaml -> Settings: how searches are generated, and what is
+rejected at startup."""
 
-from jobradar.config import _expand_matrix
+import pytest
+import yaml
 
+from jobradar.config import build_searches, load_settings
 
-def matrix(**overrides):
-    base = {
-        "locations": [
-            {"name": "Madrid", "linkedin": "Madrid, Spain", "wellfound": "madrid"},
-            {"name": "Berlin", "linkedin": "Berlin, Germany"},  # no wellfound key
-        ],
-        "sources": {
-            "linkedin": {
-                "core_keywords": ["AI Engineer"],
-                "secondary_keywords": ["LLM Engineer"],
-                "defaults": {"time_posted_seconds": 1800},
-                "secondary_defaults": {"time_posted_seconds": 7200},
-            },
-            "wellfound": {
-                "secondary_keywords": ["ai-engineer"],
-                "defaults": {"time_posted_seconds": 259200},
-            },
-        },
-    }
-    base.update(overrides)
-    return base
+LOCATIONS = [
+    {"name": "Porto", "linkedin": "Porto, Portugal", "wellfound": "porto"},
+    {"name": "Braga", "linkedin": "Braga, Portugal"},  # not covered on Wellfound
+]
+SOURCES = {
+    "linkedin": {"keywords": ["AI Engineer", "LLM Engineer"], "time_posted_seconds": 1800, "max_pages": 5},
+    "wellfound": {"keywords": ["ai-engineer"]},
+}
 
 
-def test_empty_matrix_yields_no_searches():
-    assert _expand_matrix({}) == ([], [])
+def test_every_keyword_is_searched_in_every_location_the_board_covers():
+    searches = build_searches(LOCATIONS, SOURCES)
+
+    assert [s.name for s in searches] == [
+        "AI Engineer - Porto (linkedin)", "AI Engineer - Braga (linkedin)",
+        "LLM Engineer - Porto (linkedin)", "LLM Engineer - Braga (linkedin)",
+        "ai-engineer - Porto (wellfound)",
+    ]
 
 
-def test_core_and_secondary_split_by_source():
-    core, secondary = _expand_matrix(matrix())
-    assert {s.name for s in core} == {"AI Engineer - Madrid (linkedin)", "AI Engineer - Berlin (linkedin)"}
-    assert {s.source for s in secondary} == {"linkedin", "wellfound"}
+def test_each_search_uses_its_boards_query_and_tuning():
+    by_name = {s.name: s for s in build_searches(LOCATIONS, SOURCES)}
+
+    linkedin = by_name["AI Engineer - Porto (linkedin)"]
+    assert (linkedin.source, linkedin.location, linkedin.time_posted_seconds, linkedin.max_pages) == (
+        "linkedin", "Porto, Portugal", 1800, 5)
+    wellfound = by_name["ai-engineer - Porto (wellfound)"]
+    assert (wellfound.source, wellfound.location, wellfound.time_posted_seconds) == ("wellfound", "porto", 3600)
 
 
-def test_a_location_missing_a_sources_key_is_skipped_on_that_board():
-    core, secondary = _expand_matrix(matrix())
-    wellfound_locations = {s.location_name for s in secondary if s.source == "wellfound"}
-    assert wellfound_locations == {"Madrid"}  # Berlin has no wellfound slug
+def test_no_locations_or_no_keywords_yields_no_searches():
+    assert build_searches([], SOURCES) == []
+    assert build_searches(LOCATIONS, {"linkedin": None}) == []
 
 
-def test_location_name_is_preserved_for_the_countries_toggle():
-    core, _ = _expand_matrix(matrix())
-    assert all(s.location_name in ("Madrid", "Berlin") for s in core)
-
-
-def test_secondary_defaults_falls_back_to_defaults_for_unset_keys():
-    m = matrix()
-    m["sources"]["linkedin"]["defaults"]["max_pages"] = 5
-    del m["sources"]["linkedin"]["secondary_defaults"]["time_posted_seconds"]
-    m["sources"]["linkedin"]["secondary_defaults"] = {}
-    core, secondary = _expand_matrix(m)
-    ln_secondary = [s for s in secondary if s.source == "linkedin"][0]
-    assert ln_secondary.max_pages == 5  # inherited from defaults, not the hardcoded default of 3
-
-
-def test_per_location_time_posted_seconds_overrides_tier_defaults():
-    m = matrix()
-    m["locations"][0]["time_posted_seconds"] = 999
-    core, _ = _expand_matrix(m)
-    madrid = next(s for s in core if s.location_name == "Madrid")
-    assert madrid.time_posted_seconds == 999
-
-
-def test_generated_names_are_unique_across_sources():
-    core, secondary = _expand_matrix(matrix())
-    names = [s.name for s in core + secondary]
-    assert len(names) == len(set(names))
-
-
-def _write_config(tmp_path, pipeline: dict):
-    import yaml
-
-    path = tmp_path / "config.yaml"
-    path.write_text(yaml.safe_dump({
-        "searches": [{"name": "s", "keywords": "k", "location": "l"}],
-        "pipeline": pipeline,
-    }))
-    return path
-
-
-def test_load_settings_rejects_out_of_range_values(tmp_path, monkeypatch):
-    import pytest
-
-    from jobradar.config import load_settings
-
+@pytest.fixture
+def write_config(tmp_path, monkeypatch):
     monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
     monkeypatch.setenv("TELEGRAM_CHAT_ID", "c")
-    path = _write_config(tmp_path, {"digest_hour": 25, "poll_interval_minutes": 0})
+
+    def write(**overrides):
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.safe_dump({"locations": LOCATIONS, "sources": SOURCES, **overrides}))
+        return load_settings(path, env_path=tmp_path / "missing.env")
+
+    return write
+
+
+def test_defaults_apply_when_pipeline_is_omitted(write_config):
+    settings = write_config()
+    assert (settings.min_coverage_pct, settings.digest_min_coverage_pct, settings.years_stretch) == (60, 50, 1)
+    assert settings.deep_model == "claude-haiku-5-5"
+    assert len(settings.searches) == 5
+
+
+def test_pipeline_values_override_defaults(write_config):
+    assert write_config(pipeline={"min_coverage_pct": 70, "digest_min_coverage_pct": 50}).min_coverage_pct == 70
+
+
+def test_out_of_range_values_are_all_reported_together(write_config):
     with pytest.raises(RuntimeError) as err:
-        load_settings(path, env_path=tmp_path / "missing.env")
+        write_config(pipeline={"digest_hour": 25, "poll_interval_minutes": 0})
     assert "digest_hour" in str(err.value) and "poll_interval_minutes" in str(err.value)
 
 
-def test_load_settings_accepts_defaults(tmp_path, monkeypatch):
-    from jobradar.config import load_settings
+def test_a_misspelt_setting_is_an_error_not_silently_ignored(write_config):
+    with pytest.raises(RuntimeError, match="min_coverage"):
+        write_config(pipeline={"min_coverage": 70})
 
-    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "t")
-    monkeypatch.setenv("TELEGRAM_CHAT_ID", "c")
-    settings = load_settings(_write_config(tmp_path, {}), env_path=tmp_path / "missing.env")
-    assert settings.min_coverage_pct == 80
+
+def test_a_config_without_searches_is_rejected(write_config):
+    with pytest.raises(RuntimeError, match="defines no searches"):
+        write_config(locations=[])
+
+
+def test_missing_telegram_credentials_are_rejected(tmp_path, monkeypatch):
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+    with pytest.raises(RuntimeError, match="TELEGRAM_BOT_TOKEN"):
+        load_settings(tmp_path / "config.yaml", env_path=tmp_path / "missing.env")

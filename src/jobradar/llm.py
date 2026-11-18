@@ -27,6 +27,7 @@ Design notes:
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import TypeVar
 
@@ -41,6 +42,8 @@ API_KEY_ENV = "ANTHROPIC_API_KEY"
 DEFAULT_MAX_TOKENS = 8000
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
+
+log = logging.getLogger(__name__)
 
 
 class LLMError(RuntimeError):
@@ -85,12 +88,26 @@ class ClaudeClient:
             output_format=schema,
             output_config={"effort": effort},
         )
+        _log_usage(model, response.usage)
         if response.stop_reason in ("refusal", "max_tokens"):
             raise LLMError(f"no usable output (stop_reason={response.stop_reason})")
         parsed = response.parsed_output
         if parsed is None:
             raise LLMError(f"response did not match the schema (stop_reason={response.stop_reason})")
         return parsed
+
+
+def _log_usage(model: str, usage) -> None:
+    """One line per call: the only record of what the model costs, and of
+    whether the cached prefix is being reused. The API reports input in
+    three parts -- uncached, read from cache, written to cache -- which add
+    up to the prompt's real size."""
+    cache_read = usage.cache_read_input_tokens or 0
+    cache_write = usage.cache_creation_input_tokens or 0
+    log.info(
+        "%s: %d input tokens (%d read from cache, %d written to cache), %d output",
+        model, usage.input_tokens + cache_read + cache_write, cache_read, cache_write, usage.output_tokens,
+    )
 
 
 def describe_error(exc: Exception) -> str:

@@ -23,15 +23,13 @@ class FakeSource:
 
 class FakeNotifier:
     def __init__(self):
-        self.sent: list[tuple[JobPosting, int | None, DeepScoreResult | None, bool]] = []
+        self.sent: list[tuple[JobPosting, int | None, DeepScoreResult | None, tuple[str, ...]]] = []
         self.texts: list[str] = []
         self.digests: list[tuple[list[dict], int]] = []
         self._next_message_id = 1
-        self.unfiltered_reasons: list[str | None] = []
 
-    def send_job(self, posting, score=None, deep=None, language_unverified=False, unfiltered_reason=None):
-        self.sent.append((posting, score, deep, language_unverified))
-        self.unfiltered_reasons.append(unfiltered_reason)
+    def send_job(self, posting, score=None, deep=None, warnings=()):
+        self.sent.append((posting, score, deep, warnings))
         message_id = self._next_message_id
         self._next_message_id += 1
         return message_id
@@ -120,8 +118,7 @@ def profile():
 @pytest.fixture
 def settings():
     return Settings(
-        searches=[SearchConfig(name="Search A", keywords="AI Engineer", location="Remote",
-                               source="linkedin", location_name="Remote")],
+        searches=[SearchConfig(name="Search A", keywords="AI Engineer", location="Porto")],
         telegram_bot_token="x", telegram_chat_id="y",
         deep_score_threshold=4, min_coverage_pct=80, digest_min_coverage_pct=60,
     )

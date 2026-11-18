@@ -38,14 +38,14 @@ BASE_URL = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/sear
 # Hard cap the guest endpoint applies per request -- not a preference.
 PAGE_SIZE = 10
 
-# The guest endpoint rate-limited (HTTP 429) during real testing once a poll
-# cycle started issuing pagination's back-to-back page requests on top of
-# several searches in a row -- a burst pattern that didn't exist before
-# pagination. 0.6s spacing still got 429s in practice; a live 12-request
-# burst test at 1.2s spacing came back clean (12/12 status 200), so that's
-# the empirically-set floor, not a guess. Tracked per source instance so it
-# covers both within-search pagination and back-to-back searches sharing it.
-MIN_REQUEST_INTERVAL_SECONDS = 1.2
+# The guest endpoint answers bursts with HTTP 429. Requests are therefore
+# spaced out (tracked per source instance, so it covers pagination and
+# back-to-back searches alike), and a 429 is retried once after a pause:
+# in production the throttle was seen to clear within a few seconds, while
+# giving up immediately left the same search failing cycle after cycle.
+MIN_REQUEST_INTERVAL_SECONDS = 2.5
+RATE_LIMIT_RETRY_DELAY_SECONDS = 8.0
+RATE_LIMIT_STATUS_CODES = (429, 999)  # 999 is LinkedIn's own "request denied"
 
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -70,7 +70,7 @@ class LinkedInGuestSource:
     def fetch(self, search: SearchConfig) -> list[JobPosting]:
         """Walks pages until the endpoint signals end-of-results (a partial
         page) or max_pages is hit -- see module docstring. A quiet search
-        costs exactly one request, same as before pagination existed."""
+        costs exactly one request."""
         postings: list[JobPosting] = []
         seen_ids: set[str] = set()
 
@@ -101,19 +101,20 @@ class LinkedInGuestSource:
         self._last_request_at = time.monotonic()
 
     def _fetch_page(self, search: SearchConfig, start: int) -> list[JobPosting]:
-        self._throttle()
-        params: dict[str, str] = {
+        params = {
             "keywords": search.keywords,
             "location": search.location,
             "f_TPR": f"r{search.time_posted_seconds}",
             "start": str(start),
         }
-        if search.workplace_type:
-            params["f_WT"] = search.workplace_type
-
+        self._throttle()
         resp = self._client.get(BASE_URL, params=params)
-
-        if resp.status_code in (429, 999):
+        if resp.status_code in RATE_LIMIT_STATUS_CODES:
+            log.info("'%s': HTTP %d, retrying once in %.0fs", search.name, resp.status_code, RATE_LIMIT_RETRY_DELAY_SECONDS)
+            time.sleep(RATE_LIMIT_RETRY_DELAY_SECONDS)
+            self._throttle()
+            resp = self._client.get(BASE_URL, params=params)
+        if resp.status_code in RATE_LIMIT_STATUS_CODES:
             raise RateLimitedError(f"LinkedIn returned {resp.status_code} for search '{search.name}'")
         resp.raise_for_status()
 

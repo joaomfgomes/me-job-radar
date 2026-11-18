@@ -22,14 +22,10 @@ HELP_TEXT = (
     "<b>job-radar commands</b>\n"
     "/jobs — last 10 jobs recorded\n"
     "/rejected — jobs that were scored but held back, and why\n"
-    "/countries — list locations and whether each is active\n"
-    "/countries on|off &lt;name&gt; — start or stop searching a location\n"
-    "/countries add &lt;name&gt; — validate and start searching a new location\n"
-    "/countries remove &lt;name&gt; — drop a location added via /countries add\n"
     "/stats [days] — the funnel: how many jobs were seen, filtered and alerted\n"
     "/market [days] — what postings ask for: skills, work mode, seniority, salary\n"
     "/gaps [days] — most requested skills your CV does not show\n"
-    "/status — uptime, poll health, DB counts\n"
+    "/status — uptime, poll health, jobs per search\n"
     "/help — this message\n\n"
     "Matches above the coverage threshold are pushed here automatically — "
     "these commands are just for checking in."
@@ -116,130 +112,29 @@ def format_rejected(store: Store, limit: int = 15) -> str:
     return "\n".join(lines)
 
 
-def _location_names(pipeline) -> list[str]:
-    """Rotation order, de-duplicated -- the same location appears once per
-    keyword and per source in the expanded searches. Pulled from the
-    pipeline (not settings) since matrix-derived searches -- including
-    anything added via /countries add -- are computed fresh each cycle,
-    not baked into Settings at startup."""
-    core, secondary = pipeline.current_searches()
-    names: list[str] = []
-    for search in core + secondary:
-        if search.location_name and search.location_name not in names:
-            names.append(search.location_name)
-    return names
-
-
-def format_countries(store: Store, pipeline, argument: str = "") -> str:
-    """`/countries` lists; `/countries on|off <name>` toggles a location
-    from config.yaml (or a previously-added one); `/countries add <name>`
-    validates a new one live against every configured board before
-    persisting it (see location_validation.py -- neither board rejects an
-    unrecognized location outright, so this can't just trust a 200 OK);
-    `/countries remove <name>` drops one that was added this way (a
-    config.yaml location can only be paused with /off, not removed here --
-    that file is meant to be hand-edited, not overwritten by a bot)."""
-    parts = argument.split(maxsplit=1)
-    if not parts:
-        names = _location_names(pipeline)
-        if not names:
-            return "No locations configured (config.yaml has no search_matrix)."
-        prefs = store.location_prefs()
-        custom = store.custom_locations()
-        lines = ["<b>Locations</b>"]
-        for name in names:
-            enabled = prefs.get(name, True)
-            tag = " (added)" if name in custom else ""
-            lines.append(f'{"✅" if enabled else "⏸"} {escape(name)}{tag}')
-        lines.append("")
-        lines.append(
-            "on|off &lt;name&gt; toggles · add &lt;name&gt; searches a new place · "
-            "remove &lt;name&gt; drops an added one"
-        )
-        return "\n".join(lines)
-
-    action = parts[0].lower()
-
-    if action == "add":
-        if len(parts) < 2:
-            return "Which location? e.g. /countries add Lisbon"
-        return pipeline.validate_and_add_location(parts[1].strip())
-
-    if action == "remove":
-        if len(parts) < 2:
-            return "Which location? Try /countries to see the names."
-        wanted = parts[1].strip()
-        removed = store.remove_custom_location(wanted)
-        if not removed:
-            # Might still be a real, known (config.yaml) location -- just
-            # not one this command is allowed to delete.
-            if wanted.lower() in (n.lower() for n in _location_names(pipeline)):
-                return f"'{escape(wanted)}' is defined in config.yaml -- use /countries off to pause it instead."
-            return f"'{escape(wanted)}' wasn't added via /countries add."
-        return f"Removed '{escape(wanted)}'."
-
-    if action in ("on", "off"):
-        if len(parts) < 2:
-            return "Which location? Try /countries to see the names."
-        names = _location_names(pipeline)
-        wanted = parts[1].strip().lower()
-        match = next((n for n in names if n.lower() == wanted), None)
-        if match is None:
-            return f"Unknown location {escape(parts[1])!r}. Known: {escape(', '.join(names))}"
-        store.set_location_enabled(match, action == "on")
-        verb = "now being searched" if action == "on" else "paused"
-        return f"<b>{escape(match)}</b> is {verb}. Takes effect on the next poll cycle."
-
-    return "Usage: /countries, or /countries on|off|add|remove &lt;name&gt;"
-
-
 def format_status(store: Store, pipeline, settings, started_at: float, next_run_at: float | None) -> str:
+    """Is it alive, and is every search still returning something?"""
     health = pipeline.health_snapshot()
-    uptime = _relative_age(started_at).replace(" ago", "")
-    if uptime in ("just now",):
-        uptime = "under a minute"
-
-    total = store.total_count()
     by_search = store.counts_by_search()
-
     lines = [
         "<b>job-radar status</b>",
-        f"Uptime: {uptime}",
-        f"Last poll attempt: {_relative_age(health['last_poll_at'])}",
+        f"Up since: {_relative_age(started_at)}",
+        f"Last poll: {_relative_age(health['last_poll_at'])}",
         f"Last successful fetch: {_relative_age(health['last_success_at'])}",
-        f"Next scheduled poll: {_relative_future(next_run_at)}",
-        f"Total jobs recorded: {total}",
+        f"Next poll: {_relative_future(next_run_at)}",
+        f"Jobs recorded: {store.total_count()}",
         "",
-        "<b>Core searches (every cycle):</b>",
+        "<b>Searches</b>",
     ]
-
-    def _search_line(search) -> str:
-        count = by_search.get(search.name, 0)
+    for search in settings.searches:
         errors = health["consecutive_errors"].get(search.name, 0)
         empty = health["consecutive_empty"].get(search.name, 0)
         flag = ""
         if errors:
-            flag = f" ⚠️ {errors} consecutive fetch errors"
+            flag = f" ⚠️ {errors} failed fetches in a row"
         elif empty:
-            flag = f" ({empty} consecutive empty cycles)"
-        return f"• {escape(search.name)}: {count} jobs{flag}"
-
-    core, secondary = pipeline.current_searches()
-
-    for search in core:
-        lines.append(_search_line(search))
-
-    if secondary:
-        pool_size = len(secondary)
-        batch = settings.secondary_batch_size
-        cycles_per_rotation = -(-pool_size // batch)  # ceil
-        lines.append("")
-        lines.append(
-            f"<b>Secondary searches ({batch}/cycle, full rotation ~{cycles_per_rotation} cycles):</b>"
-        )
-        for search in secondary:
-            lines.append(_search_line(search))
-
+            flag = f" ({empty} empty cycles in a row)"
+        lines.append(f"• {escape(search.name)}: {by_search.get(search.name, 0)} jobs{flag}")
     return "\n".join(lines)
 
 
@@ -258,6 +153,7 @@ OUTCOME_LABELS = {
     "low_coverage": "Low CV coverage",
     "alerted": "✅ Alerted",
     "alerted_unfiltered": "⚠️ Alerted unfiltered",
+    "repost": "Repost of a job already evaluated",
     "not_evaluated": "Seeded (first run, not evaluated)",
 }
 
@@ -388,8 +284,6 @@ def dispatch(text: str, *, store: Store, pipeline, settings, started_at: float, 
         return format_jobs(store)
     if command == "/rejected":
         return format_rejected(store)
-    if command == "/countries":
-        return format_countries(store, pipeline, argument)
     if command == "/stats":
         return format_stats(store, argument)
     if command == "/market":
